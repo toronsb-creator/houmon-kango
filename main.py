@@ -90,11 +90,7 @@ def init_db():
             ALTER TABLE staff
             ADD COLUMN address TEXT DEFAULT ''
         """)
-        if not column_exists(conn, "staff", "role"):
-        cur.execute("""
-        ALTER TABLE staff
-        ADD COLUMN role TEXT DEFAULT 'staff'
-    """)
+
 
     # -----------------------------------------------------
     # 利用者
