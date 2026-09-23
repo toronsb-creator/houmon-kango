@@ -80,9 +80,9 @@ def init_db():
             ADD COLUMN phone TEXT DEFAULT ''
         """)
         if not column_exists(conn, "staff", "role"):
-    cur.execute("""
-        ALTER TABLE staff
-        ADD COLUMN role TEXT DEFAULT 'staff'
+            cur.execute("""
+                ALTER TABLE staff
+                ADD COLUMN role TEXT DEFAULT 'staff'
     """)
 
     if not column_exists(conn, "staff", "address"):
