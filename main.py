@@ -2983,6 +2983,19 @@ def admin_calendar(
                 ＋ 訪問予定を追加
             </a>
 
+            <form
+                action="/admin/calendar/copy-previous-week"
+                method="post"
+                style="display:inline;"
+                onsubmit="return confirm('前週のシフトを今週へコピーします。よろしいですか？');"
+            >
+                <input type="hidden" name="target_year" value="{year}">
+                <input type="hidden" name="target_month" value="{month}">
+                <button type="submit" class="success">
+                    📋 前週のシフトをコピー
+                </button>
+            </form>
+
             <div class="calendar-nav">
 
                 <a
@@ -3033,6 +3046,204 @@ def admin_calendar(
     </html>
     """)
 
+
+
+# =========================================================
+# 管理者：前週のシフトを今週へコピー
+# =========================================================
+
+@app.post("/admin/calendar/copy-previous-week")
+def copy_previous_week(
+    target_year: int = Form(...),
+    target_month: int = Form(...)
+):
+    # 表示月の1日が属する週の月曜日を「今週」とする
+    target_date = date(target_year, target_month, 1)
+    from datetime import timedelta
+
+    target_monday = target_date - timedelta(days=target_date.weekday())
+    previous_monday = target_monday - timedelta(days=7)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM visits
+        WHERE visit_date >= ?
+          AND visit_date < ?
+        ORDER BY visit_date, visit_time, id
+    """, (
+        previous_monday.isoformat(),
+        (previous_monday + timedelta(days=7)).isoformat()
+    ))
+    previous_visits = cur.fetchall()
+
+    copied = 0
+    skipped = 0
+
+    for visit in previous_visits:
+        source_date = date.fromisoformat(visit["visit_date"])
+        day_offset = (source_date - previous_monday).days
+        target_visit_date = target_monday + timedelta(days=day_offset)
+
+        exists = cur.execute("""
+            SELECT id
+            FROM visits
+            WHERE staff_id = ?
+              AND visit_date = ?
+              AND visit_time = ?
+              AND (
+                    client_id = ?
+                    OR (
+                        client_id IS NULL
+                        AND ? IS NULL
+                        AND patient_name = ?
+                    )
+                  )
+            LIMIT 1
+        """, (
+            visit["staff_id"],
+            target_visit_date.isoformat(),
+            visit["visit_time"],
+            visit["client_id"],
+            visit["client_id"],
+            visit["patient_name"]
+        )).fetchone()
+
+        if exists:
+            skipped += 1
+            continue
+
+        cur.execute("""
+            INSERT INTO visits
+            (staff_id, visit_date, visit_time, patient_name, address, memo, client_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            visit["staff_id"],
+            target_visit_date.isoformat(),
+            visit["visit_time"],
+            visit["patient_name"],
+            visit["address"] or "",
+            visit["memo"] or "",
+            visit["client_id"]
+        ))
+        copied += 1
+
+    conn.commit()
+    conn.close()
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>シフトコピー完了</title>
+        {CSS}
+    </head>
+    <body>
+    <header><h1>シフトコピー完了</h1></header>
+    <div class="container">
+        {admin_nav()}
+        <div class="card">
+            <h2>前週のシフトをコピーしました</h2>
+            <p>コピーした件数：<strong>{copied}</strong>件</p>
+            <p>重複のためスキップ：<strong>{skipped}</strong>件</p>
+            <a href="/admin/calendar?year={target_year}&month={target_month}">
+                ← カレンダーへ戻る
+            </a>
+        </div>
+    </div>
+    </body>
+    </html>
+    """)
+
+
+# =========================================================
+# Googleマップ：即時オープン
+# =========================================================
+
+@app.get("/staff/{staff_id}/maps/current/{visit_id}")
+def staff_maps_current(staff_id: int, visit_id: int):
+    conn = get_db()
+    visit = conn.execute("""
+        SELECT visits.*, clients.address AS client_address
+        FROM visits
+        LEFT JOIN clients ON visits.client_id = clients.id
+        WHERE visits.id = ? AND visits.staff_id = ?
+    """, (visit_id, staff_id)).fetchone()
+    conn.close()
+
+    if not visit:
+        return HTMLResponse("訪問予定が見つかりません。", status_code=404)
+
+    address = visit["address"] or visit["client_address"] or ""
+    if not address:
+        return HTMLResponse("訪問先の住所が登録されていません。", status_code=400)
+
+    url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&destination={quote(address)}"
+        "&travelmode=driving"
+    )
+    return RedirectResponse(url, status_code=307)
+
+
+@app.get("/staff/{staff_id}/maps/next/{visit_id}")
+def staff_maps_next(staff_id: int, visit_id: int):
+    conn = get_db()
+
+    current = conn.execute("""
+        SELECT visits.*, clients.address AS client_address
+        FROM visits
+        LEFT JOIN clients ON visits.client_id = clients.id
+        WHERE visits.id = ? AND visits.staff_id = ?
+    """, (visit_id, staff_id)).fetchone()
+
+    if not current:
+        conn.close()
+        return HTMLResponse("訪問予定が見つかりません。", status_code=404)
+
+    current_address = current["address"] or current["client_address"] or ""
+
+    next_visit = conn.execute("""
+        SELECT visits.*, clients.address AS client_address
+        FROM visits
+        LEFT JOIN clients ON visits.client_id = clients.id
+        WHERE visits.staff_id = ?
+          AND visits.visit_date = ?
+          AND (
+                visits.visit_time > ?
+                OR (visits.visit_time = ? AND visits.id > ?)
+              )
+        ORDER BY visits.visit_time, visits.id
+        LIMIT 1
+    """, (
+        staff_id,
+        current["visit_date"],
+        current["visit_time"],
+        current["visit_time"],
+        current["id"]
+    )).fetchone()
+
+    conn.close()
+
+    if not next_visit:
+        return HTMLResponse("この日の次の訪問予定はありません。", status_code=404)
+
+    next_address = next_visit["address"] or next_visit["client_address"] or ""
+
+    if not current_address or not next_address:
+        return HTMLResponse("現在または次の訪問先の住所が登録されていません。", status_code=400)
+
+    url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={quote(current_address)}"
+        f"&destination={quote(next_address)}"
+        "&travelmode=driving"
+    )
+    return RedirectResponse(url, status_code=307)
 
 
 # =========================================================
@@ -3188,8 +3399,17 @@ def api_my_visits(staff=Depends(current_user)):
             "id": v["id"], "date": v["visit_date"], "time": v["visit_time"],
             "client_name": v["client_name"] or v["patient_name"],
             "phone": v["client_phone"] or "", "address": address,
-            "memo": v["memo"] or "", "google_maps_url": maps_url,
-            "next_google_maps_url": next_url
+            "memo": v["memo"] or "",
+            "google_maps_url": maps_url,
+            "next_google_maps_url": next_url,
+            "map_current_url": (
+                f"/staff/{staff['id']}/maps/current/{v['id']}"
+                if address else ""
+            ),
+            "map_next_url": (
+                f"/staff/{staff['id']}/maps/next/{v['id']}"
+                if next_url else ""
+            )
         })
     return {"ok": True, "visits": visits}
 
