@@ -1759,7 +1759,7 @@ def client_management():
                     action="/admin/clients/{client["id"]}/delete"
                     method="post"
                     style="display:inline;"
-                    onsubmit="return confirm(\"本当に削除しますか？\\nこの利用者データは元に戻せません。\");"
+                    onsubmit="return confirm('本当に削除しますか？\\nこの利用者データは元に戻せません。');"
                 >
 
                     <button
@@ -2160,7 +2160,7 @@ def admin_visits():
                     action="/admin/visits/{visit["id"]}/delete"
                     method="post"
                     style="display:inline;"
-                    onsubmit="return confirm(\"本当に削除しますか？\\nこの訪問予定・実績は元に戻せません。\");"
+                    onsubmit="return confirm('本当に削除しますか？\\nこの訪問予定・実績は元に戻せません。');"
                 >
 
                     <button
@@ -2748,7 +2748,7 @@ def edit_visit_page(visit_id: int):
             <form
                 action="/admin/visits/{visit_id}/delete"
                 method="post"
-                onsubmit="return confirm(\"本当に削除しますか？\\nこの訪問予定・実績は元に戻せません。\");"
+                onsubmit="return confirm('本当に削除しますか？\\nこの訪問予定・実績は元に戻せません。');"
             >
 
                 <button
