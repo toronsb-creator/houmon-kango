@@ -6,6 +6,7 @@ from datetime import date, datetime
 import calendar
 import html
 import os
+import re
 from urllib.parse import quote
 
 app = FastAPI()
@@ -23,6 +24,68 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE_DIR, "database.db")
+
+def normalize_birth_date(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", value)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return value
+    patterns = [
+        (r"(?:令和|R|r)\s*(\d{1,2}|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$", 2018),
+        (r"(?:平成|H|h)\s*(\d{1,2}|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$", 1988),
+        (r"(?:昭和|S|s)\s*(\d{1,2}|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$", 1925),
+        (r"(?:大正|T|t)\s*(\d{1,2}|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$", 1911),
+        (r"(?:明治|M|m)\s*(\d{1,2}|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$", 1867),
+    ]
+    for pattern, base in patterns:
+        m = re.fullmatch(pattern, value)
+        if m:
+            try:
+                y = 1 if m.group(1) == "元" else int(m.group(1))
+                return date(base + y, int(m.group(2)), int(m.group(3))).isoformat()
+            except ValueError:
+                return value
+    m = re.fullmatch(r"([RrHhSsTtMm])\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})", value)
+    if m:
+        bases = {"R": 2018, "H": 1988, "S": 1925, "T": 1911, "M": 1867}
+        try:
+            return date(bases[m.group(1).upper()] + int(m.group(2)), int(m.group(3)), int(m.group(4))).isoformat()
+        except ValueError:
+            return value
+    return value
+
+def wareki_birth_date(value: str) -> str:
+    value = (value or "").strip()
+    if not value: return ""
+    try: y,m,d=map(int,value.split("-")); dt=date(y,m,d)
+    except (ValueError,TypeError): return value
+    if dt >= date(2019,5,1): return f"令和{y-2018}年{m}月{d}日"
+    if dt >= date(1989,1,8): return f"平成{y-1988}年{m}月{d}日"
+    if dt >= date(1926,12,25): return f"昭和{y-1925}年{m}月{d}日"
+    if dt >= date(1912,7,30): return f"大正{y-1911}年{m}月{d}日"
+    return f"明治{y-1867}年{m}月{d}日"
+
+WAREKI_BIRTH_JS = r"""
+<script>
+function setupWarekiBirthDate(form) {
+ const text=form.querySelector('.wareki-birth-input'), hidden=form.querySelector('.birth-date-hidden'), picker=form.querySelector('.birth-date-picker'), error=form.querySelector('.wareki-birth-error');
+ if(!text||!hidden)return;
+ function wareki(iso){if(!iso)return '';const a=iso.split('-').map(Number),y=a[0],m=a[1],d=a[2];if(y>=2019)return `令和${y-2018}年${m}月${d}日`;if(y>=1989)return `平成${y-1988}年${m}月${d}日`;if(y>=1926)return `昭和${y-1925}年${m}月${d}日`;if(y>=1912)return `大正${y-1911}年${m}月${d}日`;return `明治${y-1867}年${m}月${d}日`;}
+ function iso(v){v=(v||'').trim();if(!v)return '';let m=v.match(/^(令和|R|r)\s*(\d+|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$/);if(m)return make(2018,m);m=v.match(/^(平成|H|h)\s*(\d+|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$/);if(m)return make(1988,m);m=v.match(/^(昭和|S|s)\s*(\d+|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$/);if(m)return make(1925,m);m=v.match(/^(大正|T|t)\s*(\d+|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$/);if(m)return make(1911,m);m=v.match(/^(明治|M|m)\s*(\d+|元)\s*[年./-]?\s*(\d{1,2})\s*[月./-]?\s*(\d{1,2})\s*日?$/);if(m)return make(1867,m);m=v.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})$/);if(m)return make(0,m);return null;}
+ function make(base,m){const y=m[2]==='元'?base+1:(base?base+Number(m[2]):Number(m[2]));const mo=Number(m[3]),d=Number(m[4]),dt=new Date(y,mo-1,d);if(dt.getFullYear()!=y||dt.getMonth()!=mo-1||dt.getDate()!=d)return null;return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;}
+ if(hidden.value&&!text.value)text.value=wareki(hidden.value);
+ text.addEventListener('change',()=>{const x=iso(text.value);if(x){hidden.value=x;text.value=wareki(x);error.textContent='';}else if(text.value.trim()){hidden.value='';error.textContent='例：平成20年12月24日 / H20/12/24';}else{hidden.value='';error.textContent='';}});
+ if(picker){picker.addEventListener('change',()=>{hidden.value=picker.value;text.value=wareki(picker.value);error.textContent='';});}
+ form.addEventListener('submit',e=>{const x=iso(text.value);if(text.value.trim()&&!x){e.preventDefault();error.textContent='生年月日を正しく入力してください。例：昭和30年4月1日';text.focus();return;}hidden.value=x||'';});
+}
+document.addEventListener('DOMContentLoaded',()=>document.querySelectorAll('.wareki-birth-form').forEach(setupWarekiBirthDate));
+</script>
+"""
 
 def hash_password(password):
     import hashlib
@@ -1681,7 +1744,7 @@ def client_management():
 
             <td>{html.escape(client["address"] or "")}</td>
 
-            <td>{html.escape(client["birth_date"] or "")}</td>
+            <td>{html.escape(wareki_birth_date(client["birth_date"] or ""))}</td>
 
             <td>{html.escape(client["memo"] or "")}</td>
 
@@ -1697,6 +1760,7 @@ def client_management():
                     action="/admin/clients/{client["id"]}/delete"
                     method="post"
                     style="display:inline;"
+                    onsubmit="return confirm('このデータを本当に削除しますか？\n削除すると元に戻せません。');"
                 >
 
                     <button
@@ -1748,7 +1812,7 @@ def client_management():
 
             <h2>新規利用者を登録</h2>
 
-            <form action="/admin/clients/add" method="post">
+            <form action="/admin/clients/add" method="post" class="wareki-birth-form">
 
                 <label>利用者名</label>
                 <input type="text" name="name" required>
@@ -1759,8 +1823,13 @@ def client_management():
                 <label>住所</label>
                 <input type="text" name="address">
 
-                <label>生年月日</label>
-                <input type="date" name="birth_date">
+                <label>生年月日（和暦）</label>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" class="wareki-birth-input" placeholder="例：平成20年12月24日" autocomplete="off">
+                    <input type="hidden" class="birth-date-hidden" name="birth_date">
+                    <input type="date" class="birth-date-picker" aria-label="カレンダーから選択" style="width:52px;min-width:52px;padding:8px;">
+                </div>
+                <small class="wareki-birth-error" style="color:#d00;display:block;margin-top:4px;"></small>
 
                 <label>メモ</label>
                 <textarea name="memo" rows="4"></textarea>
@@ -1797,6 +1866,7 @@ def client_management():
 
     </div>
 
+    {WAREKI_BIRTH_JS}
     </body>
     </html>
     """)
@@ -1810,6 +1880,8 @@ def add_client(
     birth_date: str = Form(""),
     memo: str = Form("")
 ):
+
+    birth_date = normalize_birth_date(birth_date)
 
     conn = get_db()
     cur = conn.cursor()
@@ -1886,6 +1958,7 @@ def edit_client_page(client_id: int):
             <form
                 action="/admin/clients/{client_id}/edit"
                 method="post"
+                class="wareki-birth-form"
             >
 
                 <label>利用者名</label>
@@ -1913,13 +1986,13 @@ def edit_client_page(client_id: int):
                     value="{html.escape(client["address"] or "")}"
                 >
 
-                <label>生年月日</label>
-
-                <input
-                    type="date"
-                    name="birth_date"
-                    value="{html.escape(client["birth_date"] or "")}"
-                >
+                <label>生年月日（和暦）</label>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" class="wareki-birth-input" value="{html.escape(wareki_birth_date(client["birth_date"] or ""))}" placeholder="例：平成20年12月24日" autocomplete="off">
+                    <input type="hidden" class="birth-date-hidden" name="birth_date" value="{html.escape(client["birth_date"] or "")}">
+                    <input type="date" class="birth-date-picker" value="{html.escape(client["birth_date"] or "")}" aria-label="カレンダーから選択" style="width:52px;min-width:52px;padding:8px;">
+                </div>
+                <small class="wareki-birth-error" style="color:#d00;display:block;margin-top:4px;"></small>
 
                 <label>メモ</label>
 
@@ -1938,6 +2011,7 @@ def edit_client_page(client_id: int):
 
     </div>
 
+    {WAREKI_BIRTH_JS}
     </body>
     </html>
     """)
@@ -1952,6 +2026,8 @@ def edit_client(
     birth_date: str = Form(""),
     memo: str = Form("")
 ):
+
+    birth_date = normalize_birth_date(birth_date)
 
     conn = get_db()
     cur = conn.cursor()
@@ -2076,6 +2152,7 @@ def admin_visits():
                     action="/admin/visits/{visit["id"]}/delete"
                     method="post"
                     style="display:inline;"
+                    onsubmit="return confirm('このデータを本当に削除しますか？\n削除すると元に戻せません。');"
                 >
 
                     <button
@@ -2663,6 +2740,7 @@ def edit_visit_page(visit_id: int):
             <form
                 action="/admin/visits/{visit_id}/delete"
                 method="post"
+                onsubmit="return confirm('この訪問予定を本当に削除しますか？\n削除すると元に戻せません。');"
             >
 
                 <button
@@ -3458,7 +3536,7 @@ def api_add_client(body: ClientBody, admin=Depends(require_admin)):
     conn = get_db()
     cur = conn.execute("""
         INSERT INTO clients(name,phone,address,birth_date,memo) VALUES(?,?,?,?,?)
-    """, (body.name,body.phone,body.address,body.birth_date,body.memo))
+    """, (body.name,body.phone,body.address,normalize_birth_date(body.birth_date),body.memo))
     conn.commit()
     cid = cur.lastrowid
     conn.close()
@@ -3469,7 +3547,7 @@ def api_edit_client(client_id: int, body: ClientBody, admin=Depends(require_admi
     conn = get_db()
     cur = conn.execute("""
         UPDATE clients SET name=?,phone=?,address=?,birth_date=?,memo=? WHERE id=?
-    """, (body.name,body.phone,body.address,body.birth_date,body.memo,client_id))
+    """, (body.name,body.phone,body.address,normalize_birth_date(body.birth_date),body.memo,client_id))
     conn.commit()
     conn.close()
     if cur.rowcount == 0:
