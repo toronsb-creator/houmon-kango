@@ -6,7 +6,6 @@ from datetime import date, datetime
 import calendar
 import html
 import os
-import re
 from urllib.parse import quote
 
 app = FastAPI()
@@ -30,69 +29,6 @@ def hash_password(password):
     return hashlib.sha256(
         password.encode("utf-8")
     ).hexdigest()
-
-
-def wareki_to_seireki(value):
-    """和暦入力をYYYY-MM-DDへ変換。既に西暦ならそのまま返す。"""
-    if not value:
-        return ""
-    value = value.strip()
-    # 西暦 YYYY-MM-DD
-    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
-        y, m, d = value.split("-")
-        return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
-
-    eras = {
-        "令和": 2018, "R": 2018, "R\u3000": 2018,
-        "平成": 1988, "H": 1988, "H\u3000": 1988,
-        "昭和": 1925, "S": 1925, "S\u3000": 1925,
-        "大正": 1911, "T": 1911, "T\u3000": 1911,
-        "明治": 1867, "M": 1867, "M\u3000": 1867,
-    }
-    normalized = value.upper().replace("年", "/").replace("月", "/").replace("日", "")
-    normalized = normalized.replace("\\", "/").replace("-", "/").replace(".", "/")
-    for era, base in eras.items():
-        if normalized.startswith(era):
-            rest = normalized[len(era):].strip(" /")
-            parts = [p for p in rest.split("/") if p]
-            if len(parts) == 3:
-                try:
-                    y, m, d = map(int, parts)
-                    return f"{base + y:04d}-{m:02d}-{d:02d}"
-                except ValueError:
-                    pass
-    # 元年にも対応
-    for era, base in eras.items():
-        if normalized.startswith(era + "元"):
-            rest = normalized[len(era + "元"):].strip(" /")
-            parts = [p for p in rest.split("/") if p]
-            if len(parts) == 2:
-                try:
-                    m, d = map(int, parts)
-                    return f"{base + 1:04d}-{m:02d}-{d:02d}"
-                except ValueError:
-                    pass
-    return value
-
-def seireki_to_wareki(value):
-    """YYYY-MM-DDを和暦表示へ変換。"""
-    if not value:
-        return ""
-    try:
-        y, m, d = map(int, value.split("-"))
-    except Exception:
-        return value
-    if y >= 2019:
-        return f"令和{y-2018}年{m}月{d}日"
-    if y >= 1989:
-        return f"平成{y-1988}年{m}月{d}日"
-    if y >= 1926:
-        return f"昭和{y-1925}年{m}月{d}日"
-    if y >= 1912:
-        return f"大正{y-1911}年{m}月{d}日"
-    if y >= 1868:
-        return f"明治{y-1867}年{m}月{d}日"
-    return value
 
 # =========================================================
 # データベース
@@ -250,6 +186,124 @@ def init_db():
 
 init_db()
 
+# =========================================================
+# 和暦・生年月日ヘルパー
+# =========================================================
+
+def wareki_to_iso(value):
+    """和暦入力を YYYY-MM-DD に変換。西暦入力もそのまま許可。"""
+    value = (value or "").strip()
+    if not value:
+        return ""
+
+    import re
+
+    # 既に西暦
+    m = re.fullmatch(r"(\d{4})[\-/年](\d{1,2})[\-/月](\d{1,2})日?", value)
+    if m:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return d.isoformat()
+        except ValueError:
+            return ""
+
+    # 元年 / 数字年
+    eras = {
+        "令和": 2018, "R": 2018, "r": 2018,
+        "平成": 1988, "H": 1988, "h": 1988,
+        "昭和": 1925, "S": 1925, "s": 1925,
+        "大正": 1911, "T": 1911, "t": 1911,
+        "明治": 1867, "M": 1867, "m": 1867,
+    }
+
+    compact = value.replace(" ", "").replace("　", "")
+    m = re.fullmatch(r"(令和|平成|昭和|大正|明治|[RrHhSsTtMm])(?:元|(\d{1,2}))年?(\d{1,2})月?(\d{1,2})日?", compact)
+    if not m:
+        # H20/12/24 等
+        m = re.fullmatch(r"(R|r|H|h|S|s|T|t|M|m)(?:元|(\d{1,2}))[\-/](\d{1,2})[\-/](\d{1,2})", compact)
+    if not m:
+        return ""
+
+    era = m.group(1)
+    era_year = 1 if m.group(2) is None else int(m.group(2))
+    month = int(m.group(3))
+    day = int(m.group(4))
+    try:
+        d = date(eras[era] + era_year, month, day)
+        return d.isoformat()
+    except (ValueError, KeyError):
+        return ""
+
+
+def iso_to_wareki(value):
+    """YYYY-MM-DD を 和暦表示へ。"""
+    value = (value or "").strip()
+    try:
+        d = date.fromisoformat(value)
+    except ValueError:
+        return value
+
+    if d >= date(2019, 5, 1):
+        y = d.year - 2018
+        return f"令和{y if y != 1 else '元'}年{d.month}月{d.day}日"
+    if d >= date(1989, 1, 8):
+        return f"平成{d.year - 1988}年{d.month}月{d.day}日"
+    if d >= date(1926, 12, 25):
+        return f"昭和{d.year - 1925}年{d.month}月{d.day}日"
+    if d >= date(1912, 7, 30):
+        return f"大正{d.year - 1911}年{d.month}月{d.day}日"
+    return f"明治{d.year - 1867}年{d.month}月{d.day}日"
+
+
+WAREKI_JS = r"""
+<script>
+function warekiToIso(value) {
+    value = (value || '').trim().replaceAll(' ', '').replaceAll('　', '');
+    let m = value.match(/^(令和|平成|昭和|大正|明治|[RrHhSsTtMm])(?:元|(\d{1,2}))年?(\d{1,2})月?(\d{1,2})日?$/);
+    if (!m) m = value.match(/^(R|r|H|h|S|s|T|t|M|m)(?:元|(\d{1,2}))[\\\-/](\d{1,2})[\\\-/](\d{1,2})$/);
+    if (!m) return '';
+    const base = {'令和':2018,'R':2018,'r':2018,'平成':1988,'H':1988,'h':1988,'昭和':1925,'S':1925,'s':1925,'大正':1911,'T':1911,'t':1911,'明治':1867,'M':1867,'m':1867};
+    const y = base[m[1]] + (m[2] ? Number(m[2]) : 1);
+    const mo = Number(m[3]), d = Number(m[4]);
+    const x = new Date(y, mo - 1, d);
+    if (x.getFullYear() !== y || x.getMonth() !== mo - 1 || x.getDate() !== d) return '';
+    return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+}
+function isoToWareki(iso) {
+    if (!iso) return '';
+    const p = iso.split('-').map(Number);
+    if (p.length !== 3 || !p[0]) return '';
+    const [y,m,d] = p;
+    if (y >= 2019) return `令和${y === 2019 ? '元' : y - 2018}年${m}月${d}日`;
+    if (y >= 1989) return `平成${y - 1988}年${m}月${d}日`;
+    if (y >= 1926) return `昭和${y - 1925}年${m}月${d}日`;
+    if (y >= 1912) return `大正${y - 1911}年${m}月${d}日`;
+    return `明治${y - 1867}年${m}月${d}日`;
+}
+function setupWarekiDate(form) {
+    const w = form.querySelector('.wareki-birth');
+    const iso = form.querySelector('.birth-iso');
+    const cal = form.querySelector('.birth-calendar');
+    if (!w || !iso) return;
+    if (cal) cal.addEventListener('change', () => {
+        iso.value = cal.value;
+        w.value = isoToWareki(cal.value);
+    });
+    form.addEventListener('submit', (e) => {
+        if (w.value.trim()) {
+            const v = warekiToIso(w.value);
+            if (!v) { e.preventDefault(); alert('生年月日を和暦で正しく入力してください。\n例：平成20年12月24日 / H20/12/24'); return; }
+            iso.value = v;
+        } else if (cal && cal.value) {
+            iso.value = cal.value;
+        }
+    });
+}
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.wareki-date-form').forEach(setupWarekiDate);
+});
+</script>
+"""
 
 # =========================================================
 # 共通CSS
@@ -1745,7 +1799,7 @@ def client_management():
 
             <td>{html.escape(client["address"] or "")}</td>
 
-            <td>{html.escape(client["birth_date"] or "")}</td>
+            <td>{html.escape(iso_to_wareki(client["birth_date"] or ""))}</td>
 
             <td>{html.escape(client["memo"] or "")}</td>
 
@@ -1760,8 +1814,8 @@ def client_management():
                 <form
                     action="/admin/clients/{client["id"]}/delete"
                     method="post"
-                    style="display:inline;"
                     onsubmit="return confirm('本当に削除しますか？\nこのデータは元に戻せません。');"
+                    style="display:inline;"
                 >
 
                     <button
@@ -1813,7 +1867,7 @@ def client_management():
 
             <h2>新規利用者を登録</h2>
 
-            <form action="/admin/clients/add" method="post">
+            <form action="/admin/clients/add" method="post" class="wareki-date-form">
 
                 <label>利用者名</label>
                 <input type="text" name="name" required>
@@ -1825,10 +1879,19 @@ def client_management():
                 <input type="text" name="address">
 
                 <label>生年月日</label>
-                <input type="date" id="birth_date_picker" onchange="syncBirthDateFromPicker()">
-                <input type="text" id="birth_date_wareki" placeholder="和暦で入力（例：平成20年12月24日）" oninput="syncBirthDateFromWareki()">
-                <input type="hidden" name="birth_date" id="birth_date">
-                <div class="small">カレンダーでも、和暦（令和・平成・昭和など）でも入力できます。</div>
+                <input type="hidden" name="birth_date" class="birth-iso">
+                <input
+                    type="text"
+                    name="birth_date_wareki"
+                    class="wareki-birth"
+                    placeholder="和暦で入力（例：平成20年12月24日 / H20/12/24）"
+                    autocomplete="off"
+                >
+                <div style="margin-top:8px;">
+                    <label style="font-weight:normal;">カレンダーから選択（必要な場合）</label>
+                    <input type="date" class="birth-calendar">
+                </div>
+                <div class="small">和暦を入力すると自動で西暦に変換して保存します。</div>
 
                 <label>メモ</label>
                 <textarea name="memo" rows="4"></textarea>
@@ -1876,10 +1939,11 @@ def add_client(
     phone: str = Form(""),
     address: str = Form(""),
     birth_date: str = Form(""),
+    birth_date_wareki: str = Form(""),
     memo: str = Form("")
 ):
 
-    birth_date = wareki_to_seireki(birth_date)
+    birth_date = wareki_to_iso(birth_date_wareki) if birth_date_wareki else birth_date
 
     conn = get_db()
     cur = conn.cursor()
@@ -1956,6 +2020,7 @@ def edit_client_page(client_id: int):
             <form
                 action="/admin/clients/{client_id}/edit"
                 method="post"
+                class="wareki-date-form"
             >
 
                 <label>利用者名</label>
@@ -1984,24 +2049,19 @@ def edit_client_page(client_id: int):
                 >
 
                 <label>生年月日</label>
-
-                <input
-                    type="date"
-                    id="birth_date_picker"
-                    value="{html.escape(client["birth_date"] or "")}"
-                    onchange="syncBirthDateFromPicker()"
-                >
-
+                <input type="hidden" name="birth_date" class="birth-iso" value="{html.escape(client["birth_date"] or "")}">
                 <input
                     type="text"
-                    id="birth_date_wareki"
-                    value="{html.escape(seireki_to_wareki(client["birth_date"] or ""))}"
-                    placeholder="和暦で入力（例：平成20年12月24日）"
-                    oninput="syncBirthDateFromWareki()"
+                    name="birth_date_wareki"
+                    class="wareki-birth"
+                    value="{html.escape(iso_to_wareki(client["birth_date"] or ""))}"
+                    placeholder="和暦で入力（例：平成20年12月24日 / H20/12/24）"
+                    autocomplete="off"
                 >
-
-                <input type="hidden" name="birth_date" id="birth_date" value="{html.escape(client["birth_date"] or "")}">
-                <div class="small">カレンダーでも、和暦（令和・平成・昭和など）でも入力できます。</div>
+                <div style="margin-top:8px;">
+                    <label style="font-weight:normal;">カレンダーから選択（必要な場合）</label>
+                    <input type="date" class="birth-calendar" value="{html.escape(client["birth_date"] or "")}">
+                </div>
 
                 <label>メモ</label>
 
@@ -2020,6 +2080,7 @@ def edit_client_page(client_id: int):
 
     </div>
 
+        {WAREKI_JS}
     </body>
     </html>
     """)
@@ -2032,10 +2093,11 @@ def edit_client(
     phone: str = Form(""),
     address: str = Form(""),
     birth_date: str = Form(""),
+    birth_date_wareki: str = Form(""),
     memo: str = Form("")
 ):
 
-    birth_date = wareki_to_seireki(birth_date)
+    birth_date = wareki_to_iso(birth_date_wareki) if birth_date_wareki else birth_date
 
     conn = get_db()
     cur = conn.cursor()
@@ -2159,8 +2221,8 @@ def admin_visits():
                 <form
                     action="/admin/visits/{visit["id"]}/delete"
                     method="post"
+                    onsubmit="return confirm('本当に削除しますか？\nこの実績・訪問予定は元に戻せません。');"
                     style="display:inline;"
-                    onsubmit="return confirm('本当に削除しますか？\nこのデータは元に戻せません。');"
                 >
 
                     <button
@@ -2748,7 +2810,7 @@ def edit_visit_page(visit_id: int):
             <form
                 action="/admin/visits/{visit_id}/delete"
                 method="post"
-                onsubmit="return confirm('本当に削除しますか？\nこのデータは元に戻せません。');"
+                onsubmit="return confirm('本当に削除しますか？\nこの実績・訪問予定は元に戻せません。');"
             >
 
                 <button
