@@ -1580,6 +1580,13 @@ def staff_management():
 
             <td>{html.escape(staff["address"] or "")}</td>
 
+            <td>
+                <form action="/admin/staff/{staff["id"]}/delete" method="post" style="display:inline;"
+                      onsubmit="return confirm('このスタッフを本当に削除しますか？\n関連する訪問予定も削除されます。');">
+                    <button type="submit" class="danger">削除</button>
+                </form>
+            </td>
+
         </tr>
         """
 
@@ -1697,6 +1704,33 @@ def add_staff(
         <a href="/admin/staff">戻る</a>
         """)
 
+    conn.close()
+
+    return RedirectResponse(
+        "/admin/staff",
+        status_code=303
+    )
+
+
+@app.post("/admin/staff/{staff_id}/delete")
+def delete_staff(staff_id: int):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # スタッフを削除すると、そのスタッフに紐づく訪問予定も
+    # 管理画面に残せなくなるため一緒に削除する
+    cur.execute("""
+        DELETE FROM visits
+        WHERE staff_id = ?
+    """, (staff_id,))
+
+    cur.execute("""
+        DELETE FROM staff
+        WHERE id = ?
+    """, (staff_id,))
+
+    conn.commit()
     conn.close()
 
     return RedirectResponse(
