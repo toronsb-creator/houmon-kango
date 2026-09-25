@@ -232,14 +232,34 @@ def init_db():
     if count == 0:
         cur.execute("""
             INSERT INTO staff
-            (name, email, password, phone, address)
-            VALUES (?, ?, ?, ?, ?)
+            (name, email, password, phone, address, role)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             "テストスタッフ",
             "staff@example.com",
             "1234",
             "",
-            ""
+            "",
+            "staff"
+        ))
+
+    # 管理者アカウントが無い場合だけ作成
+    admin = cur.execute(
+        "SELECT id FROM staff WHERE email = ?",
+        ("admin@example.com",)
+    ).fetchone()
+    if admin is None:
+        cur.execute("""
+            INSERT INTO staff
+            (name, email, password, phone, address, role)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            "管理者",
+            "admin@example.com",
+            "1234",
+            "",
+            "",
+            "admin"
         ))
 
     conn.commit()
@@ -659,16 +679,6 @@ def login_page():
 
             </form>
 
-            <hr>
-
-            <p class="small">
-                テスト用<br>
-                staff@example.com / 1234
-            </p>
-
-            <a href="/admin">
-                管理者画面へ
-            </a>
 
         </div>
 
@@ -688,12 +698,12 @@ def login(
     conn = get_db()
     cur = conn.cursor()
 
+    # 平文パスワードとSHA-256の両方に対応
     cur.execute("""
-        SELECT id
+        SELECT *
         FROM staff
         WHERE email = ?
-        AND password = ?
-    """, (email, password))
+    """, (email,))
 
     staff = cur.fetchone()
 
@@ -704,6 +714,19 @@ def login(
         <h2>ログイン情報が違います。</h2>
         <a href="/">ログイン画面へ戻る</a>
         """)
+
+    stored = staff["password"] or ""
+    valid = stored == password or stored == hash_password(password)
+
+    if not valid:
+        return HTMLResponse("""
+        <h2>ログイン情報が違います。</h2>
+        <a href="/">ログイン画面へ戻る</a>
+        """)
+
+    # 管理者なら管理者画面へ、スタッフならスタッフ画面へ
+    if (staff["role"] or "staff") == "admin":
+        return RedirectResponse("/admin", status_code=303)
 
     return RedirectResponse(
         f"/staff/{staff['id']}",
