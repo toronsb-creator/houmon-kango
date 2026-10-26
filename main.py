@@ -232,15 +232,19 @@ def init_db():
 
     if old_test and not main_admin:
         cur.execute("UPDATE staff SET name = ?, email = ?, role = 'admin' WHERE email = ?",
-                    ("山田孝明", "takaaki@gmail.com", "staff@example.com"))
+                    ("山田孝昭", "takaaki@gmail.com", "staff@example.com"))
     elif main_admin:
         cur.execute("UPDATE staff SET name = ?, role = 'admin' WHERE email = ?",
-                    ("山田孝明", "takaaki@gmail.com"))
+                    ("山田孝昭", "takaaki@gmail.com"))
     else:
         cur.execute("""
             INSERT INTO staff (name, email, password, phone, address, role)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, ("山田孝明", "takaaki@gmail.com", "1234", "", "", "admin"))
+        """, ("山田孝昭", "takaaki@gmail.com", "1234", "", "", "admin"))
+
+    # 指定された不要アカウントを削除する（メールアドレス完全一致）。
+    # staffテーブルのアカウント行のみ削除し、過去の訪問予定・申請データは保持する。
+    cur.execute("DELETE FROM staff WHERE lower(email) = lower(?)", ("tomoya@gmail.com",))
 
     # 2人目の管理者。既に存在する場合はパスワードを上書きせず、権限だけ確実に管理者にする。
     cur.execute("SELECT id FROM staff WHERE email = ?", ("admin@gmail.com",))
@@ -1584,6 +1588,12 @@ def staff_management():
 
             <td>{html.escape(staff["address"] or "")}</td>
 
+            <td>
+                <a href="/admin/staff/{staff["id"]}/edit">
+                    <button type="button">編集</button>
+                </a>
+            </td>
+
         </tr>
         """
 
@@ -1649,6 +1659,7 @@ def staff_management():
                     <th>メール</th>
                     <th>電話番号</th>
                     <th>住所</th>
+                    <th>操作</th>
                 </tr>
 
                 {rows}
@@ -1662,6 +1673,100 @@ def staff_management():
     </body>
     </html>
     """)
+
+
+@app.get("/admin/staff/{staff_id}/edit", response_class=HTMLResponse)
+def edit_staff_page(staff_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM staff WHERE id = ?", (staff_id,))
+    staff = cur.fetchone()
+    conn.close()
+
+    if staff is None:
+        return HTMLResponse("<h2>スタッフが見つかりません。</h2><a href='/admin/staff'>戻る</a>", status_code=404)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>スタッフ編集</title>
+        {CSS}
+    </head>
+    <body>
+        <header><h1>スタッフ編集</h1></header>
+        <div class="container">
+            {admin_nav()}
+            <div class="card">
+                <form action="/admin/staff/{staff_id}/edit" method="post">
+                    <label>名前</label>
+                    <input type="text" name="name" value="{html.escape(staff['name'] or '', quote=True)}" required>
+
+                    <label>メールアドレス</label>
+                    <input type="email" name="email" value="{html.escape(staff['email'] or '', quote=True)}" required>
+
+                    <label>新しいパスワード（変更する場合のみ入力）</label>
+                    <input type="password" name="password" autocomplete="new-password" placeholder="変更しない場合は空欄">
+
+                    <label>電話番号</label>
+                    <input type="tel" name="phone" value="{html.escape(staff['phone'] or '', quote=True)}">
+
+                    <label>住所</label>
+                    <input type="text" name="address" value="{html.escape(staff['address'] or '', quote=True)}">
+
+                    <button type="submit">変更を保存</button>
+                    <a href="/admin/staff">キャンセル</a>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/admin/staff/{staff_id}/edit")
+def edit_staff(
+    staff_id: int,
+    name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(""),
+    phone: str = Form(""),
+    address: str = Form("")
+):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM staff WHERE id = ?", (staff_id,))
+    existing = cur.fetchone()
+    if existing is None:
+        conn.close()
+        return HTMLResponse("<h2>スタッフが見つかりません。</h2><a href='/admin/staff'>戻る</a>", status_code=404)
+
+    try:
+        if password.strip():
+            cur.execute("""
+                UPDATE staff SET name = ?, email = ?, password = ?, phone = ?, address = ?
+                WHERE id = ?
+            """, (name.strip(), email.strip(), password, phone.strip(), address.strip(), staff_id))
+        else:
+            cur.execute("""
+                UPDATE staff SET name = ?, email = ?, phone = ?, address = ?
+                WHERE id = ?
+            """, (name.strip(), email.strip(), phone.strip(), address.strip(), staff_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return HTMLResponse("""
+            <h2>このメールアドレスはすでに使われています。</h2>
+            <a href="/admin/staff">スタッフ管理に戻る</a>
+        """, status_code=400)
+    finally:
+        # connが既に閉じている場合にも備えて、ここでは再度closeしない
+        pass
+
+    conn.close()
+    return RedirectResponse("/admin/staff", status_code=303)
 
 
 @app.post("/admin/staff/add")
