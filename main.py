@@ -137,6 +137,9 @@ def init_db():
     """)
 
     # 既存データベース対応
+    if not column_exists(conn, "staff", "role"):
+        cur.execute("ALTER TABLE staff ADD COLUMN role TEXT DEFAULT 'staff'")
+
     if not column_exists(conn, "staff", "phone"):
         cur.execute("""
             ALTER TABLE staff
@@ -147,12 +150,6 @@ def init_db():
         cur.execute("""
             ALTER TABLE staff
             ADD COLUMN address TEXT DEFAULT ''
-        """)
-
-    if not column_exists(conn, "staff", "role"):
-        cur.execute("""
-            ALTER TABLE staff
-            ADD COLUMN role TEXT DEFAULT 'staff'
         """)
 
     # -----------------------------------------------------
@@ -224,35 +221,38 @@ def init_db():
         """)
 
     # -----------------------------------------------------
-    # 管理者アカウント設定
+    # 管理者アカウント
     # -----------------------------------------------------
 
-    # 初回起動でスタッフがいない場合は管理者アカウントを作成する。
-    cur.execute("SELECT COUNT(*) FROM staff")
-    count = cur.fetchone()[0]
+    # 以前のテストアカウントが残っている場合は、既存パスワードを維持して名前とメールを変更。
+    cur.execute("SELECT id FROM staff WHERE email = ?", ("staff@example.com",))
+    old_test = cur.fetchone()
+    cur.execute("SELECT id FROM staff WHERE email = ?", ("takaaki@gmail.com",))
+    main_admin = cur.fetchone()
 
-    if count == 0:
+    if old_test and not main_admin:
+        cur.execute("UPDATE staff SET name = ?, email = ?, role = 'admin' WHERE email = ?",
+                    ("山田孝明", "takaaki@gmail.com", "staff@example.com"))
+    elif main_admin:
+        cur.execute("UPDATE staff SET name = ?, role = 'admin' WHERE email = ?",
+                    ("山田孝明", "takaaki@gmail.com"))
+    else:
         cur.execute("""
             INSERT INTO staff (name, email, password, phone, address, role)
             VALUES (?, ?, ?, ?, ?, ?)
         """, ("山田孝明", "takaaki@gmail.com", "1234", "", "", "admin"))
+
+    # 2人目の管理者。既に存在する場合はパスワードを上書きせず、権限だけ確実に管理者にする。
+    cur.execute("SELECT id FROM staff WHERE email = ?", ("admin@gmail.com",))
+    second_admin = cur.fetchone()
+    if second_admin:
+        cur.execute("UPDATE staff SET role = 'admin' WHERE email = ?", ("admin@gmail.com",))
     else:
-        # 既存の管理者候補アカウントがあれば、パスワードを変えず管理者にする。
-        cur.execute("SELECT id FROM staff WHERE email = ?", ("takaaki@gmail.com",))
-        admin_row = cur.fetchone()
-        if admin_row:
-            cur.execute("UPDATE staff SET name = ?, role = 'admin' WHERE id = ?", ("山田孝明", admin_row[0]))
-        else:
-            cur.execute("SELECT id FROM staff WHERE email IN (?, ?) ORDER BY CASE email WHEN ? THEN 0 ELSE 1 END LIMIT 1", ("admin@example.com", "staff@example.com", "admin@example.com"))
-            old_admin = cur.fetchone()
-            if old_admin:
-                cur.execute("UPDATE staff SET name = ?, email = ?, role = 'admin' WHERE id = ?", ("山田孝明", "takaaki@gmail.com", old_admin[0]))
-            else:
-                # 既存スタッフは残し、管理者だけを追加する。
-                cur.execute("""
-                    INSERT INTO staff (name, email, password, phone, address, role)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, ("山田孝明", "takaaki@gmail.com", "1234", "", "", "admin"))
+        cur.execute("""
+            INSERT INTO staff (name, email, password, phone, address, role)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("管理者2", "admin@gmail.com", "1234", "", "", "admin"))
+
 
     conn.commit()
     conn.close()
