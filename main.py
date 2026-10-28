@@ -1,128 +1,95 @@
-            </div>
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
+import sqlite3
+from datetime import date, datetime, timedelta
+import calendar
+import html
+import os
+from urllib.parse import quote
 
-            <table class="calendar">
-
-                <tr>
-                    <th>月</th>
-                    <th>火</th>
-                    <th>水</th>
-                    <th>木</th>
-                    <th>金</th>
-                    <th>土</th>
-                    <th>日</th>
-                </tr>
-
-                {calendar_html}
-
-            </table>
-
-            <p class="small">
-                日付をクリックすると、その日の訪問予定を追加できます。
-                <br>
-                登録済みの予定をクリックすると編集できます。
-            </p>
-
-        </div>
-
-    </div>
-
-    </body>
-    </html>
-    """)
+app = FastAPI()
 
 
+def make_tel_link(phone: str, label: str = None) -> str:
+    """電話番号を安全な tel: リンクにする。"""
+    phone = phone or ""
+    tel_number = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+    if not tel_number:
+        return html.escape(label if label is not None else phone)
+    shown = html.escape(label if label is not None else phone)
+    return f'<a href="tel:{html.escape(tel_number, quote=True)}">{shown}</a>'
+# =========================================================
+# PWA（iPhone・Androidのホーム画面に追加）
+# =========================================================
 
-@app.get("/admin/calendar/day", response_class=HTMLResponse)
-def admin_calendar_day(date: str = ""):
-    """スタッフを横軸、20分刻みの時刻を縦軸にした日別時間割。"""
-    selected_date = date or datetime.now().date().isoformat()
-    try:
-        selected_date = datetime.strptime(selected_date, "%Y-%m-%d").date().isoformat()
-    except ValueError:
-        selected_date = datetime.now().date().isoformat()
+@app.get("/manifest.webmanifest")
+def pwa_manifest():
+    return JSONResponse({
+        "name": "訪問看護システム",
+        "short_name": "訪問看護",
+        "description": "訪問予定・休暇申請管理",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#f4f7fa",
+        "theme_color": "#1677c8",
+        "icons": [{"src": "/pwa-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+    })
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, calendar_color FROM staff ORDER BY name")
-    staff_list = cur.fetchall()
-    cur.execute("""
-        SELECT visits.*, staff.name AS staff_name,
-               COALESCE(clients.name, visits.patient_name) AS client_name
-        FROM visits
-        JOIN staff ON staff.id = visits.staff_id
-        LEFT JOIN clients ON clients.id = visits.client_id
-        WHERE visits.visit_date = ?
-        ORDER BY visits.visit_time, visits.end_time
-    """, (selected_date,))
-    visits = cur.fetchall()
-    conn.close()
+@app.get("/pwa-icon.svg")
+def pwa_icon():
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="90" fill="#1677c8"/><path d="M80 245 256 95 432 245v175H305V300h-98v120H80z" fill="white"/><path d="M235 175h42v105h-42zM204 206h104v42H204z" fill="#1677c8"/></svg>'
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
 
-    by_staff_and_time = {}
-    for visit in visits:
-        try:
-            start_time = datetime.strptime(visit["visit_time"][:5], "%H:%M")
-            slot = (start_time.hour * 60 + start_time.minute - 7 * 60) // 20
-        except (ValueError, TypeError):
-            continue
-        if 0 <= slot < 36:
-            by_staff_and_time.setdefault((visit["staff_id"], slot), []).append(visit)
+@app.get("/service-worker.js")
+def service_worker():
+    # 個人情報を含む画面はキャッシュしない。オフライン時は案内だけ表示。
+    js = """const CACHE_NAME = 'houmon-kango-static-v1';
+self.addEventListener('install', (event) => { self.skipWaiting(); });
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.map((key) => key !== CACHE_NAME ? caches.delete(key) : Promise.resolve()));
+    await self.clients.claim();
+  })());
+});
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
+  event.respondWith(fetch(req).catch(() => {
+    if (req.mode === 'navigate') return new Response(
+      '<!doctype html><html lang=\\"ja\\"><meta charset=\\"utf-8\\"><meta name=\\"viewport\\" content=\\"width=device-width,initial-scale=1\\"><title>オフライン</title><body style=\\"font-family:sans-serif;padding:24px\\"><h2>インターネットに接続できません</h2><p>通信を復旧して、もう一度お試しください。</p></body></html>',
+      { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } }
+    );
+    return new Response('', { status: 503, statusText: 'Offline' });
+  }));
+});"""
+    return Response(content=js, media_type="application/javascript", headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
 
-    rows = []
-    for slot in range(36):
-        total_minutes = 7 * 60 + slot * 20
-        label = f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
-        cells = [f'<th class="time-label">{label}</th>']
-        for staff in staff_list:
-            color = html.escape(staff["calendar_color"] or "#2563eb")
-            entries = by_staff_and_time.get((staff["id"], slot), [])
-            cards = []
-            for visit in entries:
-                end = ("〜" + html.escape(visit["end_time"]) if visit["end_time"] else "")
-                cards.append(
-                    f'<a class="timeline-event" href="/admin/visits/{visit["id"]}/edit" '
-                    f'style="border-left:4px solid {color};background:{color}18">'
-                    f'<strong>{html.escape(visit["visit_time"])}{end}</strong>'
-                    f'<span>{html.escape(visit["client_name"] or "利用者名未登録")}</span>'
-                    f'<small>{html.escape(visit["address"] or "")}</small></a>'
-                )
-            cells.append(f'<td>{"".join(cards)}</td>')
-        rows.append("<tr>" + "".join(cells) + "</tr>")
-
-    staff_headers = "".join(
-        f'<th style="border-top:5px solid {html.escape(staff["calendar_color"] or "#2563eb")}">{html.escape(staff["name"])}</th>'
-        for staff in staff_list
+@app.middleware("http")
+async def add_pwa_to_html(request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type.lower():
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    html_text = body.decode("utf-8", errors="replace")
+    head_addition = (
+        '<link rel="manifest" href="/manifest.webmanifest">'
+        '<meta name="theme-color" content="#1677c8">'
+        '<meta name="apple-mobile-web-app-capable" content="yes">'
+        '<meta name="apple-mobile-web-app-status-bar-style" content="default">'
+        '<meta name="apple-mobile-web-app-title" content="訪問看護">'
+        '<link rel="apple-touch-icon" href="/pwa-icon.svg">'
     )
-    if not staff_list:
-        staff_headers = '<th>スタッフが登録されていません</th>'
-
-    return HTMLResponse(f"""<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>スタッフ別時間割</title>{CSS}
-<style>
-.timeline-wrap{{overflow:auto;max-width:100%;background:white;border:1px solid #d1d5db;border-radius:10px}}
-.timeline{{border-collapse:collapse;table-layout:fixed;min-width:max-content;width:100%}}
-.timeline th,.timeline td{{border:1px solid #d1d5db;padding:4px;vertical-align:top;min-width:150px}}
-.timeline thead th{{position:sticky;top:0;background:#f3f4f6;z-index:2;text-align:center}}
-.timeline .time-label{{position:sticky;left:0;z-index:1;min-width:62px;width:62px;background:#f9fafb;text-align:center;font-size:12px;font-weight:500}}
-.timeline td{{height:42px;min-width:170px}}
-.timeline-event{{display:flex;flex-direction:column;gap:3px;text-decoration:none;color:#172033;border-radius:5px;padding:5px;margin:2px 0;font-size:12px;overflow-wrap:anywhere}}
-.timeline-event small{{color:#4b5563}}
-@media(max-width:700px){{.timeline th,.timeline td{{min-width:140px}}.timeline .time-label{{min-width:52px;width:52px}}}}
-</style></head><body>
-<header><h1>スタッフ別・時間割</h1></header>
-<div class="container">{admin_nav()}
-<div class="card"><form method="get"><label>日付</label><input type="date" name="date" value="{selected_date}"><button type="submit">表示</button></form>
-<p><a href="/admin/calendar">← 月カレンダーへ戻る</a></p>
-<p class="small">時間は7:00〜19:00、20分刻みです。予定をタップすると編集できます。</p></div>
-<div class="timeline-wrap"><table class="timeline"><thead><tr><th class="time-label">時刻</th>{staff_headers}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>
-</div></body></html>""")
-
-# =========================================================
-# アプリ起動
-# =========================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
+    script_addition = (
+        '<script>if ("serviceWorker" in navigator) {'
+        'window.addEventListener("load", function(){navigator.serviceWorker.register("/service-worker.js").catch(function(e){console.error("PWA service worker:",e);});});'
+        '}</script>'
+    )
+    if "</head>" in html_text:
+        html_text = html_text.replace("</head>", head_addition + "</head>", 1)
+    if "</body>" in html_text:
+        html_text = html_text.replace("</body>", script_addition + "</body>", 1)
+    headers = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type", "content-encoding")}
+    return HTMLResponse(content=html_text, status_code=response.status_code, headers=headers)
