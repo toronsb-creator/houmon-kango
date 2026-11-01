@@ -214,6 +214,15 @@ def init_db():
     if not column_exists(conn, "staff", "calendar_color"):
         cur.execute("ALTER TABLE staff ADD COLUMN calendar_color TEXT DEFAULT '#2563eb'")
 
+    if not column_exists(conn, "staff", "furigana"):
+        cur.execute("ALTER TABLE staff ADD COLUMN furigana TEXT DEFAULT ''")
+
+    if not column_exists(conn, "staff", "staff_number"):
+        cur.execute("ALTER TABLE staff ADD COLUMN staff_number INTEGER")
+
+    if not column_exists(conn, "staff", "show_in_schedule"):
+        cur.execute("ALTER TABLE staff ADD COLUMN show_in_schedule INTEGER DEFAULT 1")
+
     # -----------------------------------------------------
     # 利用者
     # -----------------------------------------------------
@@ -1668,7 +1677,8 @@ def staff_management():
     cur.execute("""
         SELECT *
         FROM staff
-        ORDER BY id DESC
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END,
+                 staff_number, name, id
     """)
 
     staff_list = cur.fetchall()
@@ -1684,7 +1694,13 @@ def staff_management():
 
             <td>{staff["id"]}</td>
 
+            <td>{html.escape(str(staff["staff_number"] or "未設定"))}</td>
+
             <td>{html.escape(staff["name"])}</td>
+
+            <td>{html.escape(staff["furigana"] or "")}</td>
+
+            <td>{"表示" if staff["show_in_schedule"] else "非表示"}</td>
 
             <td>{html.escape(staff["email"])}</td>
 
@@ -1728,8 +1744,17 @@ def staff_management():
 
             <form action="/admin/staff/add" method="post">
 
+                <label>スタッフ番号（並び順）</label>
+                <input type="number" name="staff_number" min="1" placeholder="例：1、35、38">
+
                 <label>名前</label>
                 <input type="text" name="name" required>
+
+                <label>フリガナ</label>
+                <input type="text" name="furigana" placeholder="例：ヤマダ タロウ">
+
+                <label>時間割に表示する</label>
+                <label style="font-weight:400"><input type="checkbox" name="show_in_schedule" value="1" checked style="width:auto"> 表示する（訪問予定の担当者候補にも表示）</label>
 
                 <label>メールアドレス</label>
                 <input type="email" name="email" required>
@@ -1758,8 +1783,10 @@ def staff_management():
             <table>
 
                 <tr>
-                    <th>ID</th>
+                    <th>番号</th>
                     <th>名前</th>
+                    <th>フリガナ</th>
+                    <th>時間割</th>
                     <th>メール</th>
                     <th>電話番号</th>
                     <th>住所</th>
@@ -1805,8 +1832,17 @@ def edit_staff_page(staff_id: int):
             {admin_nav()}
             <div class="card">
                 <form action="/admin/staff/{staff_id}/edit" method="post">
+                    <label>スタッフ番号（並び順）</label>
+                    <input type="number" name="staff_number" min="1" value="{html.escape(str(staff['staff_number'] or ''), quote=True)}" placeholder="例：1、35、38">
+
                     <label>名前</label>
                     <input type="text" name="name" value="{html.escape(staff['name'] or '', quote=True)}" required>
+
+                    <label>フリガナ</label>
+                    <input type="text" name="furigana" value="{html.escape(staff['furigana'] or '', quote=True)}" placeholder="例：ヤマダ タロウ">
+
+                    <label>時間割に表示する</label>
+                    <label style="font-weight:400"><input type="checkbox" name="show_in_schedule" value="1" {"checked" if staff["show_in_schedule"] else ""} style="width:auto"> 表示する（訪問予定の担当者候補にも表示）</label>
 
                     <label>メールアドレス</label>
                     <input type="email" name="email" value="{html.escape(staff['email'] or '', quote=True)}" required>
@@ -1841,7 +1877,10 @@ def edit_staff(
     password: str = Form(""),
     phone: str = Form(""),
     address: str = Form(""),
-    calendar_color: str = Form("#2563eb")
+    calendar_color: str = Form("#2563eb"),
+    staff_number: str = Form(""),
+    furigana: str = Form(""),
+    show_in_schedule: str = Form("")
 ):
     conn = get_db()
     cur = conn.cursor()
@@ -1854,14 +1893,22 @@ def edit_staff(
     try:
         if password.strip():
             cur.execute("""
-                UPDATE staff SET name = ?, email = ?, password = ?, phone = ?, address = ?, calendar_color = ?
+                UPDATE staff
+                SET name = ?, email = ?, password = ?, phone = ?, address = ?,
+                    calendar_color = ?, staff_number = ?, furigana = ?, show_in_schedule = ?
                 WHERE id = ?
-            """, (name.strip(), email.strip(), password, phone.strip(), address.strip(), calendar_color, staff_id))
+            """, (name.strip(), email.strip(), password, phone.strip(), address.strip(),
+                  calendar_color, int(staff_number) if staff_number.strip() else None,
+                  furigana.strip(), 1 if show_in_schedule == "1" else 0, staff_id))
         else:
             cur.execute("""
-                UPDATE staff SET name = ?, email = ?, phone = ?, address = ?, calendar_color = ?
+                UPDATE staff
+                SET name = ?, email = ?, phone = ?, address = ?, calendar_color = ?,
+                    staff_number = ?, furigana = ?, show_in_schedule = ?
                 WHERE id = ?
-            """, (name.strip(), email.strip(), phone.strip(), address.strip(), calendar_color, staff_id))
+            """, (name.strip(), email.strip(), phone.strip(), address.strip(), calendar_color,
+                  int(staff_number) if staff_number.strip() else None,
+                  furigana.strip(), 1 if show_in_schedule == "1" else 0, staff_id))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
@@ -1883,7 +1930,10 @@ def add_staff(
     email: str = Form(...),
     password: str = Form(...),
     phone: str = Form(""),
-    address: str = Form("")
+    address: str = Form(""),
+    staff_number: str = Form(""),
+    furigana: str = Form(""),
+    show_in_schedule: str = Form("")
 ):
 
     conn = get_db()
@@ -1893,14 +1943,17 @@ def add_staff(
 
         cur.execute("""
             INSERT INTO staff
-            (name, email, password, phone, address)
-            VALUES (?, ?, ?, ?, ?)
+            (name, email, password, phone, address, staff_number, furigana, show_in_schedule)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            name,
-            email,
+            name.strip(),
+            email.strip(),
             password,
-            phone,
-            address
+            phone.strip(),
+            address.strip(),
+            int(staff_number) if staff_number.strip() else None,
+            furigana.strip(),
+            1 if show_in_schedule == "1" else 0
         ))
 
         conn.commit()
@@ -1950,7 +2003,7 @@ def client_management():
     for client in clients:
 
         rows += f"""
-        <tr>
+        <tr data-search="{html.escape(((client["name"] or "") + (client["furigana"] or "")).replace(" ", "").replace("　", "").lower(), quote=True)}">
 
             <td>{client["id"]}</td>
 
@@ -2031,15 +2084,15 @@ def client_management():
                 <label>フリガナ</label>
                 <input type="text" name="furigana" placeholder="例：ヤマダ タロウ">
 
-                <label>電話番号</label>
-                <input type="tel" name="phone">
+                <label>生年月日（和暦）</label>
+                <input type="text" name="birth_date" placeholder="例：平成10年4月1日 または 1998-04-01">
+                <small>和暦・西暦どちらでも入力できます。</small>
 
                 <label>住所</label>
                 <input type="text" name="address">
 
-                <label>生年月日（和暦）</label>
-                <input type="text" name="birth_date" placeholder="例：平成10年4月1日 または 1998-04-01">
-                <small>和暦・西暦どちらでも入力できます。</small>
+                <label>電話番号</label>
+                <input type="tel" name="phone">
 
                 <label>メモ</label>
                 <textarea name="memo" rows="4"></textarea>
@@ -2055,8 +2108,18 @@ def client_management():
         <div class="card">
 
             <h2>登録済み利用者</h2>
+            <label>利用者を検索（氏名・フリガナ）</label>
+            <input type="search" id="client_list_search" placeholder="氏名またはフリガナを入力" oninput="filterClientRows()">
+            <script>
+            function filterClientRows() {{
+                const q = (document.getElementById("client_list_search").value || "").toLowerCase().replace(/\\s/g, "");
+                document.querySelectorAll("#client_list_table tbody tr[data-search]").forEach(row => {{
+                    row.style.display = row.dataset.search.includes(q) ? "" : "none";
+                }});
+            }}
+            </script>
 
-            <table>
+            <table id="client_list_table">
 
                 <tr>
                     <th>ID</th>
@@ -2189,13 +2252,9 @@ def edit_client_page(client_id: int):
                 <label>フリガナ</label>
                 <input type="text" name="furigana" value="{html.escape(client["furigana"] or "", quote=True)}" placeholder="例：ヤマダ タロウ">
 
-                <label>電話番号</label>
-
-                <input
-                    type="tel"
-                    name="phone"
-                    value="{html.escape(client["phone"] or "")}"
-                >
+                <label>生年月日（和暦）</label>
+                <input type="text" name="birth_date" value="{html.escape(format_wareki(client["birth_date"] or ""), quote=True)}" placeholder="例：平成10年4月1日 または 1998-04-01">
+                <small>和暦・西暦どちらでも入力できます。</small>
 
                 <label>住所</label>
 
@@ -2205,9 +2264,13 @@ def edit_client_page(client_id: int):
                     value="{html.escape(client["address"] or "")}"
                 >
 
-                <label>生年月日（和暦）</label>
-                <input type="text" name="birth_date" value="{html.escape(format_wareki(client["birth_date"] or ""), quote=True)}" placeholder="例：平成10年4月1日 または 1998-04-01">
-                <small>和暦・西暦どちらでも入力できます。</small>
+                <label>電話番号</label>
+
+                <input
+                    type="tel"
+                    name="phone"
+                    value="{html.escape(client["phone"] or "")}"
+                >
 
                 <label>メモ</label>
 
@@ -2459,9 +2522,10 @@ def add_visit_page(date: str = ""):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, name
+        SELECT id, name, furigana, staff_number, show_in_schedule
         FROM staff
-        ORDER BY name
+        WHERE COALESCE(show_in_schedule, 1) = 1
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END, staff_number, name
     """)
 
     staff_list = cur.fetchall()
@@ -2480,9 +2544,11 @@ def add_visit_page(date: str = ""):
 
     for staff in staff_list:
 
+        staff_search = f'{staff["name"] or ""} {staff["furigana"] or ""} {staff["staff_number"] or ""}'
+        staff_label = f'{staff["staff_number"]}番　' if staff["staff_number"] else ''
         staff_options += f"""
-        <option value="{staff["id"]}">
-            {html.escape(staff["name"])}
+        <option value="{staff["id"]}" data-search="{html.escape(staff_search, quote=True)}">
+            {html.escape(staff_label + staff["name"])}
         </option>
         """
 
@@ -2519,6 +2585,15 @@ def add_visit_page(date: str = ""):
         {CSS}
 
         <script>
+
+        function filterStaff() {{
+            const q = (document.getElementById("staff_search").value || "").toLowerCase();
+            const select = document.getElementById("staff_id");
+            for (const option of select.options) {{
+                if (!option.value) {{ option.hidden = false; continue; }}
+                option.hidden = !(option.text.toLowerCase().includes(q) || (option.dataset.search || "").toLowerCase().includes(q));
+            }}
+        }}
 
         function filterClients() {{
             const q = (document.getElementById("client_search").value || "").toLowerCase();
@@ -2571,9 +2646,12 @@ def add_visit_page(date: str = ""):
                 method="post"
             >
 
+                <label>スタッフを検索（氏名・フリガナ・番号）</label>
+                <input type="search" id="staff_search" placeholder="名前・フリガナ・番号で検索" oninput="filterStaff()">
+
                 <label>スタッフ</label>
 
-                <select name="staff_id" required>
+                <select name="staff_id" id="staff_id" required>
                     {staff_options}
                 </select>
 
@@ -2771,9 +2849,9 @@ def edit_visit_page(visit_id: int):
         """)
 
     cur.execute("""
-        SELECT id, name
+        SELECT id, name, furigana, staff_number, show_in_schedule
         FROM staff
-        ORDER BY name
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END, staff_number, name
     """)
 
     staff_list = cur.fetchall()
@@ -2797,12 +2875,12 @@ def edit_visit_page(visit_id: int):
         if staff["id"] == visit["staff_id"]:
             selected = "selected"
 
+        staff_search = f'{staff["name"] or ""} {staff["furigana"] or ""} {staff["staff_number"] or ""}'
+        staff_label = f'{staff["staff_number"]}番　' if staff["staff_number"] else ''
+        hidden_label = "（時間割非表示）" if not staff["show_in_schedule"] else ""
         staff_options += f"""
-        <option
-            value="{staff["id"]}"
-            {selected}
-        >
-            {html.escape(staff["name"])}
+        <option value="{staff["id"]}" data-search="{html.escape(staff_search, quote=True)}" {selected}>
+            {html.escape(staff_label + staff["name"] + hidden_label)}
         </option>
         """
 
@@ -2847,6 +2925,15 @@ def edit_visit_page(visit_id: int):
         {CSS}
 
         <script>
+
+        function filterStaff() {{
+            const q = (document.getElementById("staff_search").value || "").toLowerCase();
+            const select = document.getElementById("staff_id");
+            for (const option of select.options) {{
+                if (!option.value) {{ option.hidden = false; continue; }}
+                option.hidden = !(option.text.toLowerCase().includes(q) || (option.dataset.search || "").toLowerCase().includes(q));
+            }}
+        }}
 
         function filterClients() {{
             const q = (document.getElementById("client_search").value || "").toLowerCase();
@@ -2905,9 +2992,12 @@ def edit_visit_page(visit_id: int):
                 method="post"
             >
 
+                <label>スタッフを検索（氏名・フリガナ・番号）</label>
+                <input type="search" id="staff_search" placeholder="名前・フリガナ・番号で検索" oninput="filterStaff()">
+
                 <label>スタッフ</label>
 
-                <select name="staff_id" required>
+                <select name="staff_id" id="staff_id" required>
                     {staff_options}
                 </select>
 
@@ -3108,37 +3198,40 @@ def delete_visit(visit_id: int):
 
 
 # =========================================================
-# 管理者：先週の訪問予定を今週へコピー
+# 管理者：今週の訪問予定を来週へコピー／来週分を一括削除
 # =========================================================
 
-@app.post("/admin/calendar/copy-last-week")
-def copy_last_week():
+def get_current_and_next_week():
     today = date.today()
     this_monday = today - timedelta(days=today.weekday())
-    last_monday = this_monday - timedelta(days=7)
-    last_sunday = this_monday - timedelta(days=1)
+    next_monday = this_monday + timedelta(days=7)
+    next_sunday = next_monday + timedelta(days=6)
+    return this_monday, next_monday, next_sunday
+
+
+@app.post("/admin/calendar/copy-this-week")
+def copy_this_week():
+    this_monday, next_monday, next_sunday = get_current_and_next_week()
+    this_sunday = this_monday + timedelta(days=6)
 
     conn = get_db()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT staff_id, visit_date, visit_time, end_time, patient_name,
                address, memo, client_id
         FROM visits
         WHERE visit_date >= ? AND visit_date <= ?
         ORDER BY visit_date, visit_time, id
-    """, (last_monday.isoformat(), last_sunday.isoformat()))
-    previous_visits = cur.fetchall()
+    """, (this_monday.isoformat(), this_sunday.isoformat()))
+    source_visits = cur.fetchall()
 
     copied = 0
     skipped = 0
-
     try:
-        for visit in previous_visits:
+        for visit in source_visits:
             source_date = date.fromisoformat(visit["visit_date"])
             target_date = source_date + timedelta(days=7)
 
-            # 同じスタッフ・日付・時間・利用者の予定があれば二重登録しない
             if visit["client_id"] is not None:
                 cur.execute("""
                     SELECT 1 FROM visits
@@ -3151,8 +3244,7 @@ def copy_last_week():
                 cur.execute("""
                     SELECT 1 FROM visits
                     WHERE staff_id = ? AND visit_date = ? AND visit_time = ?
-                      AND (client_id IS NULL)
-                      AND patient_name = ?
+                      AND client_id IS NULL AND patient_name = ?
                     LIMIT 1
                 """, (visit["staff_id"], target_date.isoformat(),
                       visit["visit_time"], visit["patient_name"]))
@@ -3168,25 +3260,39 @@ def copy_last_week():
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 visit["staff_id"], target_date.isoformat(),
-                visit["visit_time"], visit["end_time"] or "", visit["patient_name"],
-                visit["address"] or "", visit["memo"] or "",
-                visit["client_id"]
+                visit["visit_time"], visit["end_time"] or "",
+                visit["patient_name"], visit["address"] or "",
+                visit["memo"] or "", visit["client_id"]
             ))
             copied += 1
 
         conn.commit()
     except Exception:
         conn.rollback()
-        conn.close()
         raise
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
     return RedirectResponse(
         f"/admin/calendar?copy_result={copied}&copy_skipped={skipped}",
+        status_code=303
+    )
+
+
+@app.post("/admin/calendar/delete-next-week")
+def delete_next_week():
+    _, next_monday, next_sunday = get_current_and_next_week()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM visits
+        WHERE visit_date >= ? AND visit_date <= ?
+    """, (next_monday.isoformat(), next_sunday.isoformat()))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return RedirectResponse(
+        f"/admin/calendar?deleted_next_week={deleted}",
         status_code=303
     )
 
@@ -3203,7 +3309,8 @@ def admin_calendar(
     year: int = None,
     month: int = None,
     copy_result: int = None,
-    copy_skipped: int = 0
+    copy_skipped: int = 0,
+    deleted_next_week: int = None
 ):
 
     today = date.today()
@@ -3386,15 +3493,24 @@ def admin_calendar(
 
         <div class="card">
 
-            <form action="/admin/calendar/copy-last-week" method="post"
-                  onsubmit="return confirm('先週（月〜日）の訪問予定を今週の同じ曜日にコピーします。続けますか？');"
+            <form action="/admin/calendar/copy-this-week" method="post"
+                  onsubmit="return confirm('今週（月〜日）の訪問予定を来週の同じ曜日にコピーします。来週に同じ予定がある場合は重複登録しません。続けますか？');"
                   style="display:inline-block; margin-right:10px;">
                 <button type="submit" class="success">
-                    先週分を今週へコピー
+                    今週分を来週へコピー
+                </button>
+            </form>
+
+            <form action="/admin/calendar/delete-next-week" method="post"
+                  onsubmit="return confirm('来週（月〜日）の訪問予定をすべて削除します。本当に実行しますか？この操作は取り消せません。');"
+                  style="display:inline-block; margin-right:10px;">
+                <button type="submit" class="danger">
+                    来週分を一括削除
                 </button>
             </form>
 
             {f'<div class="info-box">コピー完了：{copy_result}件を追加しました。重複などでスキップ：{copy_skipped}件。</div>' if copy_result is not None else ''}
+            {f'<div class="info-box">来週分を{deleted_next_week}件削除しました。</div>' if deleted_next_week is not None else ''}
 
             <a href="/admin/calendar/day?date={today.isoformat()}" class="add-link" style="margin-right:8px;">今日のスタッフ別時間割</a>
             <a
@@ -3467,7 +3583,13 @@ def admin_calendar_day(date: str = ""):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, name, calendar_color FROM staff ORDER BY name")
+    cur.execute("""
+        SELECT id, name, calendar_color, staff_number
+        FROM staff
+        WHERE COALESCE(show_in_schedule, 1) = 1
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END,
+                 staff_number, name
+    """)
     staff_list = cur.fetchall()
     cur.execute("""
         SELECT visits.*, staff.name AS staff_name,
