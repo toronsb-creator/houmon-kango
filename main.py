@@ -174,6 +174,38 @@ def parse_birth_date(value):
 def confirm_delete_form(action, label="削除"):
     return f"<form action='{action}' method='post' style='display:inline;' onsubmit=\"return confirm('本当に{label}しますか？この操作は取り消せません。');\"><button type='submit' class='danger'>{label}</button></form>"
 
+
+def visit_conflict(conn, staff_id, visit_date, visit_time, end_time="", exclude_id=None):
+    """同じスタッフの同日訪問について、時間帯の重なりを検出する。終了未入力は20分枠として扱う。"""
+    try:
+        start = datetime.strptime((visit_time or "")[:5], "%H:%M")
+        end = datetime.strptime((end_time or "")[:5], "%H:%M") if end_time else start + timedelta(minutes=20)
+    except ValueError:
+        return "訪問時刻の形式が正しくありません。"
+    if end <= start:
+        return "終了時刻は開始時刻より後に設定してください。"
+    sql = "SELECT id, visit_time, end_time, patient_name FROM visits WHERE staff_id = ? AND visit_date = ?"
+    params = [staff_id, visit_date]
+    if exclude_id is not None:
+        sql += " AND id != ?"
+        params.append(exclude_id)
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    for row in cur.fetchall():
+        try:
+            other_start = datetime.strptime((row["visit_time"] or "")[:5], "%H:%M")
+            other_end = datetime.strptime((row["end_time"] or "")[:5], "%H:%M") if row["end_time"] else other_start + timedelta(minutes=20)
+        except ValueError:
+            continue
+        if start < other_end and other_start < end:
+            return f"同じスタッフに訪問予定が重複しています（{row['visit_time']}〜{row['end_time'] or '20分枠'}：{row['patient_name']}）。時間または担当スタッフを変更してください。"
+    return ""
+
+
+def service_filter_sql(service_type):
+    return "" if service_type in (None, "", "all") else " AND COALESCE(visits.service_type, '看護') = ?"
+
+
 def init_db():
 
     conn = get_db()
@@ -326,6 +358,45 @@ def init_db():
 
     if not column_exists(conn, "visits", "end_time"):
         cur.execute("ALTER TABLE visits ADD COLUMN end_time TEXT DEFAULT ''")
+
+    # 改善案②：看護／リハ区分と利用者休みフラグ
+    if not column_exists(conn, "visits", "service_type"):
+        cur.execute("ALTER TABLE visits ADD COLUMN service_type TEXT DEFAULT '看護'")
+    if not column_exists(conn, "visits", "is_day_off"):
+        cur.execute("ALTER TABLE visits ADD COLUMN is_day_off INTEGER DEFAULT 0")
+
+    # 同時送信などでアプリ側チェックをすり抜けないよう、DB側でも時間帯重複を拒否
+    cur.execute("DROP TRIGGER IF EXISTS prevent_visit_overlap_insert")
+    cur.execute("""
+        CREATE TRIGGER prevent_visit_overlap_insert
+        BEFORE INSERT ON visits
+        WHEN EXISTS (
+            SELECT 1 FROM visits v
+            WHERE v.staff_id = NEW.staff_id
+              AND v.visit_date = NEW.visit_date
+              AND time(NEW.visit_time) < time(COALESCE(NULLIF(NEW.end_time, ''), time(NEW.visit_time, '+20 minutes')))
+              AND time(v.visit_time) < time(COALESCE(NULLIF(v.end_time, ''), time(v.visit_time, '+20 minutes')))
+              AND time(NEW.visit_time) < time(COALESCE(NULLIF(v.end_time, ''), time(v.visit_time, '+20 minutes')))
+              AND time(v.visit_time) < time(COALESCE(NULLIF(NEW.end_time, ''), time(NEW.visit_time, '+20 minutes')))
+        )
+        BEGIN SELECT RAISE(ABORT, 'visit time overlap'); END
+    """)
+    cur.execute("DROP TRIGGER IF EXISTS prevent_visit_overlap_update")
+    cur.execute("""
+        CREATE TRIGGER prevent_visit_overlap_update
+        BEFORE UPDATE OF staff_id, visit_date, visit_time, end_time ON visits
+        WHEN EXISTS (
+            SELECT 1 FROM visits v
+            WHERE v.id != NEW.id
+              AND v.staff_id = NEW.staff_id
+              AND v.visit_date = NEW.visit_date
+              AND time(NEW.visit_time) < time(COALESCE(NULLIF(NEW.end_time, ''), time(NEW.visit_time, '+20 minutes')))
+              AND time(v.visit_time) < time(COALESCE(NULLIF(v.end_time, ''), time(v.visit_time, '+20 minutes')))
+              AND time(NEW.visit_time) < time(COALESCE(NULLIF(v.end_time, ''), time(v.visit_time, '+20 minutes')))
+              AND time(v.visit_time) < time(COALESCE(NULLIF(NEW.end_time, ''), time(NEW.visit_time, '+20 minutes')))
+        )
+        BEGIN SELECT RAISE(ABORT, 'visit time overlap'); END
+    """)
 
     # -----------------------------------------------------
     # 管理者アカウント
@@ -660,6 +731,23 @@ tr:last-child td {
     border: 1px solid var(--border);
 }
 
+/* 改善案②：印刷・ドラッグ＆ドロップ・休み表示 */
+.print-button { background:#475569; margin:4px; }
+.calendar-event { cursor:grab; }
+.calendar td.drop-target { outline:3px dashed #1677c8; outline-offset:-4px; background:#eff6ff; }
+.calendar-event.day-off, .timeline-event.day-off { background:#fee2e2 !important; border-left-color:#dc2626 !important; color:#991b1b !important; }
+.filter-row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin:12px 0 18px; }
+.filter-row > div { min-width:170px; flex:1; }
+.filter-row label { margin-top:0; }
+@media print {
+    header, .nav, .no-print, button, form, .calendar-nav a, .add-link { display:none !important; }
+    body { background:white !important; }
+    .container { max-width:none; padding:0; }
+    .card { border:0; box-shadow:none; padding:0; }
+    .calendar td { height:110px; }
+    .calendar-event, .timeline-event { break-inside:avoid; }
+}
+
 @media (max-width: 700px) {
 
     header {
@@ -878,7 +966,7 @@ def staff_home(staff_id: int):
         <div class="event">
             <strong>{html.escape(visit["visit_time"])}</strong><br>
             {html.escape(client_name)}<br>
-            {html.escape(visit["address"] or "")}<br>
+            {(f'<a href="https://www.google.com/maps/search/?api=1&query={quote(visit["address"] or "")}" target="_blank" rel="noopener">{html.escape(visit["address"] or "")} 🗺️</a>') if visit["address"] else ""}<br>
             {phone_html}
         </div>
         """
@@ -951,7 +1039,8 @@ def staff_home(staff_id: int):
 def staff_calendar(
     staff_id: int,
     year: int = None,
-    month: int = None
+    month: int = None,
+    service_type: str = "all"
 ):
 
     today = date.today()
@@ -993,11 +1082,13 @@ def staff_calendar(
         WHERE visits.staff_id = ?
         AND visits.visit_date >= ?
         AND visits.visit_date < ?
+        AND (? = 'all' OR COALESCE(visits.service_type, '看護') = ?)
         ORDER BY visits.visit_date, visits.visit_time
     """, (
         staff_id,
         first_day.isoformat(),
-        next_month_date.isoformat()
+        next_month_date.isoformat(),
+        service_type, service_type
     ))
 
     visits = cur.fetchall()
@@ -1047,13 +1138,13 @@ def staff_calendar(
                     or visit["patient_name"]
                 )
 
+                is_off = bool(visit["is_day_off"])
+                event_style = "border-left-color:#dc2626;background:#fee2e2;color:#991b1b" if is_off else f"border-left-color:{html.escape(visit['staff_color'] or '#2563eb')};background:{html.escape(visit['staff_color'] or '#2563eb')}18"
                 events += f"""
-                <div class="event" style="border-left-color:{html.escape(visit['staff_color'] or '#2563eb')};background:{html.escape(visit['staff_color'] or '#2563eb')}18">
-                    <strong>
-                        {html.escape(visit["visit_time"])}{('〜' + html.escape(visit['end_time'])) if visit['end_time'] else ''}
-                    </strong>
-                    <br>
-                    {html.escape(client_name)}
+                <div class="event" style="{event_style}">
+                    <strong>{html.escape(visit["visit_time"])}{('〜' + html.escape(visit['end_time'])) if visit['end_time'] else ''}</strong><br>
+                    {html.escape(client_name)} {"【休み】" if is_off else ""}<br>
+                    <small>{html.escape(visit['service_type'] or '看護')}</small>
                 </div>
                 """
 
@@ -1110,7 +1201,7 @@ def staff_calendar(
 
             <div class="calendar-nav">
 
-                <a href="/staff/{staff_id}/calendar?year={prev_year}&month={prev_month}">
+                <a href="/staff/{staff_id}/calendar?year={prev_year}&month={prev_month}&service_type={quote(service_type)}">
                     ← 前月
                 </a>
 
@@ -1118,11 +1209,17 @@ def staff_calendar(
                     {year}年{month}月
                 </h2>
 
-                <a href="/staff/{staff_id}/calendar?year={next_year}&month={next_month}">
+                <a href="/staff/{staff_id}/calendar?year={next_year}&month={next_month}&service_type={quote(service_type)}">
                     次月 →
                 </a>
 
             </div>
+
+            <form method="get" class="filter-row no-print">
+                <input type="hidden" name="year" value="{year}"><input type="hidden" name="month" value="{month}">
+                <div><label>業務区分</label><select name="service_type"><option value="all" {"selected" if service_type == "all" else ""}>すべて</option><option value="看護" {"selected" if service_type == "看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type == "リハビリ" else ""}>リハビリのみ</option></select></div>
+                <button type="submit">絞り込む</button><button type="button" class="print-button" onclick="window.print()">印刷／PDF</button>
+            </form>
 
             <table class="calendar">
 
@@ -1227,13 +1324,14 @@ def staff_visits(staff_id: int):
             """
 
         phone_html = make_tel_link(visit["client_phone"] or "", "📞 " + (visit["client_phone"] or "電話番号未登録"))
+        map_link = (f'<a href="https://www.google.com/maps/search/?api=1&query={quote(current_address)}" target="_blank" rel="noopener">{html.escape(current_address)} 🗺️</a>' if current_address else "")
         rows += f"""
         <tr>
             <td>{html.escape(visit["visit_date"])}</td>
             <td>{html.escape(visit["visit_time"])}</td>
             <td>{html.escape(client_name)}</td>
             <td>{phone_html}</td>
-            <td>{html.escape(current_address)}</td>
+            <td>{map_link}</td>
             <td>{html.escape(visit["memo"] or "")}</td>
             <td>{route_buttons or '<span class="small">住所が登録されていません</span>'}</td>
         </tr>
@@ -1242,7 +1340,7 @@ def staff_visits(staff_id: int):
     if not rows:
         rows = """
         <tr>
-            <td colspan="7">
+            <td colspan="8">
                 訪問予定はありません。
             </td>
         </tr>
@@ -2011,7 +2109,7 @@ def client_management():
 
             <td>{make_tel_link(client["phone"] or "")}</td>
 
-            <td>{html.escape(client["address"] or "")}</td>
+            <td>{(f'<a href="https://www.google.com/maps/search/?api=1&query={quote(client["address"] or "")}" target="_blank" rel="noopener">{html.escape(client["address"] or "")} 🗺️</a>') if client["address"] else ""}</td>
 
             <td>{html.escape(format_wareki(client["birth_date"] or ""))}</td>
 
@@ -2410,9 +2508,11 @@ def admin_visits():
 
             <td>{html.escape(visit["staff_name"])}</td>
 
-            <td>{html.escape(client_name)}</td>
+            <td>{html.escape(client_name)} {"【休み】" if visit["is_day_off"] else ""}</td>
 
-            <td>{html.escape(visit["address"] or "")}</td>
+            <td>{html.escape(visit["service_type"] or "看護")}</td>
+
+            <td>{(f'<a href="https://www.google.com/maps/search/?api=1&query={quote(visit["address"] or "")}" target="_blank" rel="noopener">{html.escape(visit["address"] or "")} 🗺️</a>') if visit["address"] else ""}</td>
 
             <td>{html.escape(visit["memo"] or "")}</td>
 
@@ -2482,6 +2582,7 @@ def admin_visits():
             >
                 ＋ 訪問予定を追加
             </a>
+            <button type="button" class="print-button no-print" onclick="window.print()">印刷／PDF</button>
 
             <table>
 
@@ -2490,6 +2591,7 @@ def admin_visits():
                     <th>時間</th>
                     <th>スタッフ</th>
                     <th>利用者</th>
+                    <th>区分</th>
                     <th>訪問先</th>
                     <th>メモ</th>
                     <th>操作</th>
@@ -2672,6 +2774,11 @@ def add_visit_page(date: str = ""):
                 <label>終了予定時刻</label>
                 <input type="time" name="end_time">
 
+                <label>業務区分</label>
+                <select name="service_type"><option value="看護">看護</option><option value="リハビリ">リハビリ</option></select>
+
+                <label style="font-weight:400"><input type="checkbox" name="is_day_off" value="1" style="width:auto"> 利用者の休みとして登録（カレンダーに赤色表示）</label>
+
                 <label>利用者を検索（氏名・フリガナ）</label>
                 <input type="search" id="client_search" placeholder="名前・フリガナを入力して絞り込み" oninput="filterClients()">
 
@@ -2751,7 +2858,9 @@ def add_visit(
     end_time: str = Form(""),
     client_id: int = Form(...),
     address: str = Form(""),
-    memo: str = Form("")
+    memo: str = Form(""),
+    service_type: str = Form("看護"),
+    is_day_off: str = Form("")
 ):
 
     conn = get_db()
@@ -2776,6 +2885,11 @@ def add_visit(
         </a>
         """)
 
+    conflict = visit_conflict(conn, staff_id, visit_date, visit_time, end_time)
+    if conflict:
+        conn.close()
+        return HTMLResponse(f"<meta charset='utf-8'><h2>登録できません</h2><p>{html.escape(conflict)}</p><a href='/admin/visits/add?date={quote(visit_date)}'>入力画面に戻る</a>", status_code=409)
+
     # 利用者の名前を旧 patient_name にも保存
     patient_name = client["name"]
 
@@ -2793,9 +2907,11 @@ def add_visit(
             address,
             memo,
             client_id,
-            end_time
+            end_time,
+            service_type,
+            is_day_off
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         staff_id,
         visit_date,
@@ -2804,7 +2920,9 @@ def add_visit(
         address,
         memo,
         client_id,
-        end_time
+        end_time,
+        service_type if service_type in ("看護", "リハビリ") else "看護",
+        1 if is_day_off == "1" else 0
     ))
 
     conn.commit()
@@ -3018,6 +3136,11 @@ def edit_visit_page(visit_id: int):
                 <label>終了予定時刻</label>
                 <input type="time" name="end_time" value="{html.escape(visit["end_time"] or "")}">
 
+                <label>業務区分</label>
+                <select name="service_type"><option value="看護" {"selected" if (visit["service_type"] or "看護") == "看護" else ""}>看護</option><option value="リハビリ" {"selected" if visit["service_type"] == "リハビリ" else ""}>リハビリ</option></select>
+
+                <label style="font-weight:400"><input type="checkbox" name="is_day_off" value="1" {"checked" if visit["is_day_off"] else ""} style="width:auto"> 利用者の休みとして登録（カレンダーに赤色表示）</label>
+
                 <label>利用者を検索（氏名・フリガナ）</label>
                 <input type="search" id="client_search" placeholder="名前・フリガナを入力して絞り込み" oninput="filterClients()">
 
@@ -3116,7 +3239,9 @@ def edit_visit(
     end_time: str = Form(""),
     client_id: int = Form(...),
     address: str = Form(""),
-    memo: str = Form("")
+    memo: str = Form(""),
+    service_type: str = Form("看護"),
+    is_day_off: str = Form("")
 ):
 
     conn = get_db()
@@ -3139,6 +3264,11 @@ def edit_visit(
         <a href="/admin/calendar">戻る</a>
         """)
 
+    conflict = visit_conflict(conn, staff_id, visit_date, visit_time, end_time, exclude_id=visit_id)
+    if conflict:
+        conn.close()
+        return HTMLResponse(f"<meta charset='utf-8'><h2>保存できません</h2><p>{html.escape(conflict)}</p><a href='/admin/visits/{visit_id}/edit'>編集画面に戻る</a>", status_code=409)
+
     patient_name = client["name"]
 
     if not address:
@@ -3154,7 +3284,9 @@ def edit_visit(
             patient_name = ?,
             address = ?,
             memo = ?,
-            client_id = ?
+            client_id = ?,
+            service_type = ?,
+            is_day_off = ?
         WHERE id = ?
     """, (
         staff_id,
@@ -3165,6 +3297,8 @@ def edit_visit(
         address,
         memo,
         client_id,
+        service_type if service_type in ("看護", "リハビリ") else "看護",
+        1 if is_day_off == "1" else 0,
         visit_id
     ))
 
@@ -3218,7 +3352,7 @@ def copy_this_week():
     cur = conn.cursor()
     cur.execute("""
         SELECT staff_id, visit_date, visit_time, end_time, patient_name,
-               address, memo, client_id
+               address, memo, client_id, service_type, is_day_off
         FROM visits
         WHERE visit_date >= ? AND visit_date <= ?
         ORDER BY visit_date, visit_time, id
@@ -3256,13 +3390,14 @@ def copy_this_week():
             cur.execute("""
                 INSERT INTO visits
                     (staff_id, visit_date, visit_time, end_time, patient_name,
-                     address, memo, client_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     address, memo, client_id, service_type, is_day_off)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 visit["staff_id"], target_date.isoformat(),
                 visit["visit_time"], visit["end_time"] or "",
                 visit["patient_name"], visit["address"] or "",
-                visit["memo"] or "", visit["client_id"]
+                visit["memo"] or "", visit["client_id"],
+                visit["service_type"] or "看護", visit["is_day_off"] or 0
             ))
             copied += 1
 
@@ -3301,6 +3436,29 @@ def delete_next_week():
 # 管理者カレンダー
 # =========================================================
 
+@app.post("/admin/visits/{visit_id}/move")
+def move_visit_date(visit_id: int, new_date: str = Form(...)):
+    try:
+        new_date = date.fromisoformat(new_date).isoformat()
+    except ValueError:
+        return JSONResponse({"ok": False, "message": "日付が正しくありません。"}, status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT staff_id, visit_time, end_time FROM visits WHERE id = ?", (visit_id,))
+    visit = cur.fetchone()
+    if not visit:
+        conn.close()
+        return JSONResponse({"ok": False, "message": "予定が見つかりません。"}, status_code=404)
+    conflict = visit_conflict(conn, visit["staff_id"], new_date, visit["visit_time"], visit["end_time"], exclude_id=visit_id)
+    if conflict:
+        conn.close()
+        return JSONResponse({"ok": False, "message": conflict}, status_code=409)
+    cur.execute("UPDATE visits SET visit_date = ? WHERE id = ?", (new_date, visit_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "date": new_date})
+
+
 @app.get(
     "/admin/calendar",
     response_class=HTMLResponse
@@ -3310,7 +3468,9 @@ def admin_calendar(
     month: int = None,
     copy_result: int = None,
     copy_skipped: int = 0,
-    deleted_next_week: int = None
+    deleted_next_week: int = None,
+    staff_id: int = 0,
+    service_type: str = "all"
 ):
 
     today = date.today()
@@ -3341,6 +3501,9 @@ def admin_calendar(
 
     conn = get_db()
     cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    staff_filter_list = cur.fetchall()
+    staff_filter_options = "".join(f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(st["name"])}</option>' for st in staff_filter_list)
 
     cur.execute("""
         SELECT
@@ -3355,10 +3518,13 @@ def admin_calendar(
         ON visits.client_id = clients.id
         WHERE visits.visit_date >= ?
         AND visits.visit_date < ?
+        AND (? = 0 OR visits.staff_id = ?)
+        AND (? = 'all' OR COALESCE(visits.service_type, '看護') = ?)
         ORDER BY visits.visit_date, visits.visit_time
     """, (
         first_day.isoformat(),
-        next_month_date.isoformat()
+        next_month_date.isoformat(),
+        staff_id, staff_id, service_type, service_type
     ))
 
     visits = cur.fetchall()
@@ -3415,11 +3581,14 @@ def admin_calendar(
                     or visit["patient_name"]
                 )
 
+                is_off = bool(visit["is_day_off"])
+                event_style = "border-left-color:#dc2626;background:#fee2e2;color:#991b1b" if is_off else f"border-left-color:{html.escape(visit['staff_color'] or '#2563eb')};background:{html.escape(visit['staff_color'] or '#2563eb')}18"
                 events += f"""
                 <a
                     href="/admin/visits/{visit["id"]}/edit"
-                    class="calendar-event"
-                    style="border-left-color:{html.escape(visit['staff_color'] or '#2563eb')};background:{html.escape(visit['staff_color'] or '#2563eb')}18"
+                    class="calendar-event {"day-off" if is_off else ""}"
+                    draggable="true" data-visit-id="{visit['id']}"
+                    style="{event_style}"
                 >
 
                     <strong>
@@ -3431,8 +3600,9 @@ def admin_calendar(
                     </span>
 
                     <span>
-                        {html.escape(client_name)}
+                        {html.escape(client_name)} {"【休み】" if is_off else ""}
                     </span>
+                    <span>{html.escape(visit["service_type"] or "看護")}</span>
 
                 </a>
                 """
@@ -3520,10 +3690,17 @@ def admin_calendar(
                 ＋ 訪問予定を追加
             </a>
 
+            <form method="get" class="filter-row no-print">
+                <input type="hidden" name="year" value="{year}"><input type="hidden" name="month" value="{month}">
+                <div><label>スタッフ</label><select name="staff_id"><option value="0">全スタッフ</option>{staff_filter_options}</select></div>
+                <div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type == "看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type == "リハビリ" else ""}>リハビリのみ</option></select></div>
+                <button type="submit">絞り込む</button><button type="button" class="print-button" onclick="window.print()">印刷／PDF</button>
+            </form>
+
             <div class="calendar-nav">
 
                 <a
-                    href="/admin/calendar?year={prev_year}&month={prev_month}"
+                    href="/admin/calendar?year={prev_year}&month={prev_month}&staff_id={staff_id}&service_type={quote(service_type)}"
                 >
                     ← 前月
                 </a>
@@ -3533,7 +3710,7 @@ def admin_calendar(
                 </h2>
 
                 <a
-                    href="/admin/calendar?year={next_year}&month={next_month}"
+                    href="/admin/calendar?year={next_year}&month={next_month}&staff_id={staff_id}&service_type={quote(service_type)}"
                 >
                     次月 →
                 </a>
@@ -3565,7 +3742,27 @@ def admin_calendar(
         </div>
 
     </div>
-
+    <script>
+    let draggedVisitId = null;
+    document.querySelectorAll('.calendar-event[draggable="true"]').forEach(el => {{
+      el.addEventListener('dragstart', e => {{ draggedVisitId = el.dataset.visitId; e.dataTransfer.setData('text/plain', draggedVisitId); }});
+    }});
+    document.querySelectorAll('.calendar td:not(.empty)').forEach(cell => {{
+      cell.addEventListener('dragover', e => {{ e.preventDefault(); cell.classList.add('drop-target'); }});
+      cell.addEventListener('dragleave', () => cell.classList.remove('drop-target'));
+      cell.addEventListener('drop', async e => {{
+        e.preventDefault(); cell.classList.remove('drop-target');
+        const id = e.dataTransfer.getData('text/plain') || draggedVisitId;
+        const dateLink = cell.querySelector('a[href*="/admin/visits/add?date="]');
+        if (!id || !dateLink) return;
+        const newDate = new URL(dateLink.href).searchParams.get('date');
+        const body = new URLSearchParams({{new_date:newDate}});
+        const res = await fetch('/admin/visits/' + id + '/move', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body}});
+        const data = await res.json();
+        if (data.ok) location.reload(); else alert(data.message || '移動できませんでした');
+      }});
+    }});
+    </script>
     </body>
     </html>
     """)
@@ -3573,7 +3770,7 @@ def admin_calendar(
 
 
 @app.get("/admin/calendar/day", response_class=HTMLResponse)
-def admin_calendar_day(date: str = ""):
+def admin_calendar_day(date: str = "", service_type: str = "all"):
     """スタッフを横軸、20分刻みの時刻を縦軸にした日別時間割。"""
     selected_date = date or datetime.now().date().isoformat()
     try:
@@ -3598,8 +3795,9 @@ def admin_calendar_day(date: str = ""):
         JOIN staff ON staff.id = visits.staff_id
         LEFT JOIN clients ON clients.id = visits.client_id
         WHERE visits.visit_date = ?
+          AND (? = 'all' OR COALESCE(visits.service_type, '看護') = ?)
         ORDER BY visits.visit_time, visits.end_time
-    """, (selected_date,))
+    """, (selected_date, service_type, service_type))
     visits = cur.fetchall()
     conn.close()
 
@@ -3624,12 +3822,15 @@ def admin_calendar_day(date: str = ""):
             cards = []
             for visit in entries:
                 end = ("〜" + html.escape(visit["end_time"]) if visit["end_time"] else "")
+                off = bool(visit["is_day_off"])
+                card_color = "#dc2626" if off else color
+                card_bg = "#fee2e2" if off else color + "18"
                 cards.append(
-                    f'<a class="timeline-event" href="/admin/visits/{visit["id"]}/edit" '
-                    f'style="border-left:4px solid {color};background:{color}18">'
+                    f'<a class="timeline-event {"day-off" if off else ""}" href="/admin/visits/{visit["id"]}/edit" '
+                    f'style="border-left:4px solid {card_color};background:{card_bg}">'
                     f'<strong>{html.escape(visit["visit_time"])}{end}</strong>'
-                    f'<span>{html.escape(visit["client_name"] or "利用者名未登録")}</span>'
-                    f'<small>{html.escape(visit["address"] or "")}</small></a>'
+                    f'<span>{html.escape(visit["client_name"] or "利用者名未登録")} {"【休み】" if off else ""}</span>'
+                    f'<small>{html.escape(visit["service_type"] or "看護")} / {html.escape(visit["address"] or "")}</small></a>'
                 )
             cells.append(f'<td>{"".join(cards)}</td>')
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -3657,8 +3858,8 @@ def admin_calendar_day(date: str = ""):
 </style></head><body>
 <header><h1>スタッフ別・時間割</h1></header>
 <div class="container">{admin_nav()}
-<div class="card"><form method="get"><label>日付</label><input type="date" name="date" value="{selected_date}"><button type="submit">表示</button></form>
-<p><a href="/admin/calendar">← 月カレンダーへ戻る</a></p>
+<div class="card"><form method="get" class="filter-row"><div><label>日付</label><input type="date" name="date" value="{selected_date}"></div><div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type == "看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type == "リハビリ" else ""}>リハビリのみ</option></select></div><button type="submit">表示</button><button type="button" class="print-button" onclick="window.print()">印刷／PDF</button></form>
+<p class="no-print"><a href="/admin/calendar">← 月カレンダーへ戻る</a></p>
 <p class="small">時間は7:00〜19:00、20分刻みです。予定をタップすると編集できます。</p></div>
 <div class="timeline-wrap"><table class="timeline"><thead><tr><th class="time-label">時刻</th>{staff_headers}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 </div></body></html>""")
