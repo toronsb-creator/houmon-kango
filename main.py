@@ -1275,76 +1275,105 @@ def staff_visits(staff_id: int):
     visits = cur.fetchall()
     conn.close()
 
-    rows = ""
+    # 日付ごとに訪問予定をまとめる
+    grouped_visits = {}
+    for visit in visits:
+        grouped_visits.setdefault(visit["visit_date"], []).append(visit)
 
-    for i, visit in enumerate(visits):
+    day_sections = ""
+    for visit_date, day_visits in grouped_visits.items():
+        day_rows = ""
 
-        client_name = visit["client_name"] or visit["patient_name"]
-        current_address = visit["address"] or visit["client_address"] or ""
+        for i, visit in enumerate(day_visits):
+            client_name = visit["client_name"] or visit["patient_name"]
+            current_address = visit["address"] or visit["client_address"] or ""
 
-        destination_url = (
-            "https://www.google.com/maps/dir/?api=1"
-            f"&destination={quote(current_address)}"
-            "&travelmode=driving"
-        ) if current_address else ""
+            destination_url = (
+                "https://www.google.com/maps/dir/?api=1"
+                f"&destination={quote(current_address)}"
+                "&travelmode=driving"
+            ) if current_address else ""
 
-        next_visit = None
-        if i + 1 < len(visits):
-            candidate = visits[i + 1]
-            if candidate["visit_date"] == visit["visit_date"]:
-                next_visit = candidate
+            next_visit = day_visits[i + 1] if i + 1 < len(day_visits) else None
+            next_url = ""
+            next_name = ""
+            if next_visit is not None:
+                next_address = next_visit["address"] or next_visit["client_address"] or ""
+                next_name = next_visit["client_name"] or next_visit["patient_name"]
+                if current_address and next_address:
+                    next_url = (
+                        "https://www.google.com/maps/dir/?api=1"
+                        f"&origin={quote(current_address)}"
+                        f"&destination={quote(next_address)}"
+                        "&travelmode=driving"
+                    )
 
-        next_url = ""
-        next_name = ""
-        if next_visit is not None:
-            next_address = next_visit["address"] or next_visit["client_address"] or ""
-            next_name = next_visit["client_name"] or next_visit["patient_name"]
-            if current_address and next_address:
-                next_url = (
-                    "https://www.google.com/maps/dir/?api=1"
-                    f"&origin={quote(current_address)}"
-                    f"&destination={quote(next_address)}"
-                    "&travelmode=driving"
-                )
+            route_buttons = ""
+            if destination_url:
+                route_buttons += f"""
+                    <a href="{html.escape(destination_url, quote=True)}"
+                       target="_blank" rel="noopener" class="route-button">
+                        🗺️ ここへ行く
+                    </a>
+                """
+            if next_url:
+                route_buttons += f"""
+                    <a href="{html.escape(next_url, quote=True)}"
+                       target="_blank" rel="noopener" class="route-button next-route-button">
+                        🗺️ 次の患者へ（{html.escape(next_name)}）
+                    </a>
+                """
 
-        route_buttons = ""
-        if destination_url:
-            route_buttons += f"""
-                <a href="{html.escape(destination_url, quote=True)}"
-                   target="_blank" rel="noopener" class="route-button">
-                    🗺️ ここへ行く
-                </a>
+            phone_html = make_tel_link(
+                visit["client_phone"] or "",
+                "📞 " + (visit["client_phone"] or "電話番号未登録")
+            )
+            map_link = (
+                f'<a href="https://www.google.com/maps/search/?api=1&query={quote(current_address)}" target="_blank" rel="noopener">{html.escape(current_address)} 🗺️</a>'
+                if current_address else ""
+            )
+            service_type = visit["service_type"] if "service_type" in visit.keys() else "看護"
+            day_rows += f"""
+                <tr>
+                    <td class="time-cell">{html.escape(visit["visit_time"] or "")}</td>
+                    <td>{html.escape(service_type or "看護")}</td>
+                    <td><strong>{html.escape(client_name or "")}</strong></td>
+                    <td>{phone_html}</td>
+                    <td>{map_link}</td>
+                    <td>{html.escape(visit["memo"] or "")}</td>
+                    <td>{route_buttons or '<span class="small">住所が登録されていません</span>'}</td>
+                </tr>
             """
-        if next_url:
-            route_buttons += f"""
-                <a href="{html.escape(next_url, quote=True)}"
-                   target="_blank" rel="noopener" class="route-button next-route-button">
-                    🗺️ 次の患者へ（{html.escape(next_name)}）
-                </a>
-            """
 
-        phone_html = make_tel_link(visit["client_phone"] or "", "📞 " + (visit["client_phone"] or "電話番号未登録"))
-        map_link = (f'<a href="https://www.google.com/maps/search/?api=1&query={quote(current_address)}" target="_blank" rel="noopener">{html.escape(current_address)} 🗺️</a>' if current_address else "")
-        rows += f"""
-        <tr>
-            <td>{html.escape(visit["visit_date"])}</td>
-            <td>{html.escape(visit["visit_time"])}</td>
-            <td>{html.escape(client_name)}</td>
-            <td>{phone_html}</td>
-            <td>{map_link}</td>
-            <td>{html.escape(visit["memo"] or "")}</td>
-            <td>{route_buttons or '<span class="small">住所が登録されていません</span>'}</td>
-        </tr>
+        try:
+            d = datetime.strptime(visit_date, "%Y-%m-%d").date()
+            weekday = "月火水木金土日"[d.weekday()]
+            date_label = f"{d.year}年{d.month}月{d.day}日（{weekday}）"
+        except (ValueError, TypeError):
+            date_label = html.escape(str(visit_date))
+
+        day_sections += f"""
+            <section class="visit-day-card">
+                <div class="visit-day-heading">
+                    <h2>📅 {date_label}</h2>
+                    <span class="visit-count">{len(day_visits)}件</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="day-visit-table">
+                        <thead>
+                            <tr>
+                                <th>時間</th><th>区分</th><th>利用者</th><th>電話</th>
+                                <th>訪問先</th><th>メモ</th><th>ルート</th>
+                            </tr>
+                        </thead>
+                        <tbody>{day_rows}</tbody>
+                    </table>
+                </div>
+            </section>
         """
 
-    if not rows:
-        rows = """
-        <tr>
-            <td colspan="8">
-                訪問予定はありません。
-            </td>
-        </tr>
-        """
+    if not day_sections:
+        day_sections = '<div class="empty-visits">訪問予定はありません。</div>'
 
     return HTMLResponse(f"""
     <!DOCTYPE html>
@@ -1355,13 +1384,38 @@ def staff_visits(staff_id: int):
         <title>訪問予定</title>
         {CSS}
         <style>
+            .visit-day-card {{
+                background: #fff; border: 1px solid #dce3ea; border-radius: 12px;
+                margin: 18px 0; overflow: hidden; box-shadow: 0 2px 7px rgba(0,0,0,.04);
+            }}
+            .visit-day-heading {{
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 10px; padding: 13px 16px; background: #edf5fc;
+                border-bottom: 1px solid #dce8f2;
+            }}
+            .visit-day-heading h2 {{ margin: 0; font-size: 18px; color: #174b75; }}
+            .visit-count {{ background: #1677c8; color: white; border-radius: 20px;
+                padding: 4px 11px; font-size: 13px; font-weight: bold; white-space: nowrap; }}
+            .table-wrap {{ overflow-x: auto; }}
+            .day-visit-table {{ width: 100%; min-width: 760px; border-collapse: collapse; margin: 0; }}
+            .day-visit-table th, .day-visit-table td {{ padding: 10px 9px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: middle; }}
+            .day-visit-table th {{ background: #f8fafc; white-space: nowrap; }}
+            .day-visit-table tbody tr:last-child td {{ border-bottom: 0; }}
+            .time-cell {{ font-weight: bold; white-space: nowrap; color: #174b75; }}
             .route-button {{
                 display: inline-block; margin: 3px; padding: 8px 12px;
                 background: #1677c8; color: white; text-decoration: none;
-                border-radius: 7px; font-weight: 600; font-size: 13px;
+                border-radius: 7px; font-weight: 600; font-size: 13px; white-space: nowrap;
             }}
             .route-button:hover {{ opacity: 0.85; }}
             .next-route-button {{ background: #16a34a; }}
+            .empty-visits {{ background: white; padding: 25px; border-radius: 10px; text-align: center; }}
+            @media (max-width: 700px) {{ .visit-day-heading h2 {{ font-size: 16px; }} }}
+            @media print {{
+                header, nav, .nav, .route-button {{ display: none !important; }}
+                .visit-day-card {{ break-inside: avoid; box-shadow: none; }}
+                body {{ background: white !important; }}
+            }}
         </style>
     </head>
     <body>
@@ -1370,15 +1424,9 @@ def staff_visits(staff_id: int):
         {staff_nav(staff_id)}
         <div class="card">
             <p class="small">
-                「ここへ行く」は現在地から訪問先まで、「次の患者へ」は現在の訪問先から同日の次の訪問先までのルートをGoogleマップで開きます。
+                日付ごとに訪問予定をまとめています。「ここへ行く」は現在地から訪問先まで、「次の患者へ」は同日の次の訪問先までのルートをGoogleマップで開きます。
             </p>
-            <table>
-                <tr>
-                    <th>日付</th><th>時間</th><th>利用者</th><th>電話</th>
-                    <th>訪問先</th><th>メモ</th><th>ルート</th>
-                </tr>
-                {rows}
-            </table>
+            {day_sections}
         </div>
     </div>
     </body>
