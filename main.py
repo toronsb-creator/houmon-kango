@@ -796,6 +796,7 @@ def admin_nav():
         <a href="/admin/clients">利用者管理</a>
         <a href="/admin/visits">訪問予定</a>
         <a href="/admin/calendar">カレンダー</a>
+        <a href="/admin/leave/history">休暇履歴</a>
     </div>
     """
 
@@ -807,7 +808,7 @@ def staff_nav(staff_id):
         <a href="/staff/{staff_id}/calendar">カレンダー</a>
         <a href="/staff/{staff_id}/visits">訪問予定</a>
         <a href="/staff/{staff_id}/leave">休暇申請</a>
-        <a href="/staff/{staff_id}/requests">申請状況</a>
+        <a href="/staff/{staff_id}/requests">休暇履歴・申請状況</a>
     </div>
     """
 
@@ -1475,8 +1476,25 @@ def leave_page(staff_id: int):
                 <label>終了日</label>
                 <input type="date" name="end_date" required>
 
-                <label>理由</label>
-                <textarea name="reason" rows="4"></textarea>
+                <label>申請理由</label>
+                <select name="reason_choice" id="reason_choice" onchange="toggleOtherLeaveReason()" required>
+                    <option value="私用のため" selected>私用のため</option>
+                    <option value="体調不良のため">体調不良のため</option>
+                    <option value="通院のため">通院のため</option>
+                    <option value="家庭の事情のため">家庭の事情のため</option>
+                    <option value="その他">その他</option>
+                </select>
+                <div id="other_leave_reason_wrap" style="display:none;">
+                    <label>その他の理由</label>
+                    <input type="text" name="reason_other" id="reason_other" maxlength="200" placeholder="理由を入力してください">
+                </div>
+                <script>
+                function toggleOtherLeaveReason() {{
+                    const isOther = document.getElementById('reason_choice').value === 'その他';
+                    document.getElementById('other_leave_reason_wrap').style.display = isOther ? 'block' : 'none';
+                    document.getElementById('reason_other').required = isOther;
+                }}
+                </script>
 
                 <button type="submit">
                     申請する
@@ -1498,11 +1516,33 @@ def submit_leave(
     staff_id: int,
     start_date: str = Form(...),
     end_date: str = Form(...),
-    reason: str = Form("")
+    reason_choice: str = Form("私用のため"),
+    reason_other: str = Form("")
 ):
+
+    # 日付の逆転・不正入力を防止
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        if end < start:
+            return HTMLResponse("<meta charset='utf-8'><h2>終了日は開始日以降にしてください。</h2><a href='/staff/" + str(staff_id) + "/leave'>戻る</a>", status_code=400)
+    except ValueError:
+        return HTMLResponse("<meta charset='utf-8'><h2>日付が正しくありません。</h2><a href='/staff/" + str(staff_id) + "/leave'>戻る</a>", status_code=400)
+
+    allowed_reasons = {"私用のため", "体調不良のため", "通院のため", "家庭の事情のため", "その他"}
+    if reason_choice not in allowed_reasons:
+        reason_choice = "私用のため"
+    reason = reason_other.strip() if reason_choice == "その他" else reason_choice
+    if not reason:
+        return HTMLResponse("<meta charset='utf-8'><h2>申請理由を入力してください。</h2><a href='/staff/" + str(staff_id) + "/leave'>戻る</a>", status_code=400)
 
     conn = get_db()
     cur = conn.cursor()
+
+    cur.execute("SELECT id FROM staff WHERE id = ?", (staff_id,))
+    if cur.fetchone() is None:
+        conn.close()
+        return HTMLResponse("スタッフが見つかりません。", status_code=404)
 
     cur.execute("""
         INSERT INTO leave_requests
@@ -1538,84 +1578,137 @@ def staff_requests(staff_id: int):
 
     conn = get_db()
     cur = conn.cursor()
+    cur.execute("SELECT name FROM staff WHERE id = ?", (staff_id,))
+    staff = cur.fetchone()
+    if staff is None:
+        conn.close()
+        return HTMLResponse("スタッフが見つかりません。", status_code=404)
 
     cur.execute("""
-        SELECT *
-        FROM leave_requests
+        SELECT * FROM leave_requests
         WHERE staff_id = ?
-        ORDER BY id DESC
+        ORDER BY start_date DESC, id DESC
     """, (staff_id,))
-
     requests = cur.fetchall()
-
     conn.close()
 
+    approved_days = 0
+    pending_count = 0
     rows = ""
-
     for request in requests:
-
+        status = request["status"] or "申請中"
+        if status == "承認":
+            try:
+                approved_days += (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+            except (ValueError, TypeError):
+                pass
+        elif status == "申請中":
+            pending_count += 1
         rows += f"""
         <tr>
-            <td>{html.escape(request["start_date"])}</td>
-            <td>{html.escape(request["end_date"])}</td>
+            <td>{html.escape(format_wareki(request["start_date"]))}</td>
+            <td>{html.escape(format_wareki(request["end_date"]))}</td>
             <td>{html.escape(request["reason"] or "")}</td>
-            <td>{html.escape(request["status"])}</td>
+            <td><strong>{html.escape(status)}</strong></td>
             <td>{html.escape(request["reject_reason"] or "")}</td>
         </tr>
         """
 
     if not rows:
-        rows = """
-        <tr>
-            <td colspan="5">
-                申請はありません。
-            </td>
-        </tr>
-        """
+        rows = '<tr><td colspan="5">休暇申請の履歴はありません。</td></tr>'
 
     return HTMLResponse(f"""
-    <!DOCTYPE html>
-    <html lang="ja">
-
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>申請状況</title>
-        {CSS}
-    </head>
-
-    <body>
-
-    <header>
-        <h1>申請状況</h1>
-    </header>
-
-    <div class="container">
-
-        {staff_nav(staff_id)}
-
-        <div class="card">
-
-            <table>
-
-                <tr>
-                    <th>開始日</th>
-                    <th>終了日</th>
-                    <th>理由</th>
-                    <th>状態</th>
-                    <th>却下理由</th>
-                </tr>
-
-                {rows}
-
-            </table>
-
+    <!DOCTYPE html><html lang="ja"><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>休暇履歴・申請状況</title>{CSS}
+    </head><body>
+    <header><h1>休暇履歴・申請状況</h1></header>
+    <div class="container">{staff_nav(staff_id)}
+      <div class="card">
+        <h2>{html.escape(staff["name"])} さんの休暇履歴</h2>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;">
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">承認済み取得日数</div><strong style="font-size:26px;color:#1677c8;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請中</div><strong style="font-size:26px;color:#d97706;">{pending_count}件</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請履歴</div><strong style="font-size:26px;">{len(requests)}件</strong></div>
         </div>
+        <p class="small">承認済み日数は開始日・終了日を含む暦日数で集計しています。申請中・却下は取得日数に含みません。</p>
+        <h3>申請・取得履歴</h3>
+        <table><tr><th>開始日</th><th>終了日</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
+      </div>
+    </div></body></html>
+    """)
 
-    </div>
 
-    </body>
-    </html>
+# =========================================================
+# 管理者：スタッフ別休暇履歴
+# =========================================================
+
+@app.get("/admin/leave/history", response_class=HTMLResponse)
+def admin_leave_history(staff_id: int = 0):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff WHERE role != 'admin' OR role IS NULL ORDER BY name")
+    staff_list = cur.fetchall()
+    cur.execute("""
+        SELECT leave_requests.*, staff.name AS staff_name
+        FROM leave_requests
+        LEFT JOIN staff ON leave_requests.staff_id = staff.id
+        WHERE (? = 0 OR leave_requests.staff_id = ?)
+        ORDER BY leave_requests.start_date DESC, leave_requests.id DESC
+    """, (staff_id, staff_id))
+    requests = cur.fetchall()
+    conn.close()
+
+    options = '<option value="0">全スタッフ</option>'
+    for st in staff_list:
+        options += f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(st["name"])}</option>'
+
+    approved_days = 0
+    pending_count = 0
+    rows = ""
+    for request in requests:
+        status = request["status"] or "申請中"
+        if status == "承認":
+            try:
+                approved_days += (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+            except (ValueError, TypeError):
+                pass
+        elif status == "申請中":
+            pending_count += 1
+        rows += f"""
+        <tr>
+          <td>{html.escape(request["staff_name"] or "退職・削除済みスタッフ")}</td>
+          <td>{html.escape(format_wareki(request["start_date"]))}</td>
+          <td>{html.escape(format_wareki(request["end_date"]))}</td>
+          <td>{html.escape(request["reason"] or "")}</td>
+          <td>{html.escape(status)}</td>
+          <td>{html.escape(request["reject_reason"] or "")}</td>
+        </tr>"""
+    if not rows:
+        rows = '<tr><td colspan="6">該当する履歴はありません。</td></tr>'
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html><html lang="ja"><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>スタッフ別休暇履歴</title>{CSS}
+    </head><body>
+    <header><h1>スタッフ別休暇履歴</h1></header>
+    <div class="container">{admin_nav()}
+      <div class="card">
+        <h2>スタッフごとの休暇履歴</h2>
+        <form method="get" action="/admin/leave/history" class="filter-row">
+          <div><label>スタッフを選択</label><select name="staff_id">{options}</select></div>
+          <button type="submit">表示</button>
+        </form>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;">
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">承認済み取得日数（表示対象）</div><strong style="font-size:26px;color:#1677c8;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請中</div><strong style="font-size:26px;color:#d97706;">{pending_count}件</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請履歴</div><strong style="font-size:26px;">{len(requests)}件</strong></div>
+        </div>
+        <p class="small">承認済み日数は開始日・終了日を含む暦日数で集計しています。全スタッフを選ぶと会社全体の合計です。</p>
+        <table><tr><th>スタッフ</th><th>開始日</th><th>終了日</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
+      </div>
+    </div></body></html>
     """)
 
 
@@ -1731,6 +1824,7 @@ def admin_page():
         <div class="card">
 
             <h2>休暇申請一覧</h2>
+            <p><a href="/admin/leave/history">スタッフ別の休暇取得履歴を確認する →</a></p>
 
             <table>
 
