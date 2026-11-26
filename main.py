@@ -333,6 +333,40 @@ def init_db():
             ADD COLUMN reject_reason TEXT DEFAULT ''
         """)
 
+    # 有給／普通の休みを区別（既存申請は普通の休みとして保持）
+    if not column_exists(conn, "leave_requests", "leave_type"):
+        cur.execute("ALTER TABLE leave_requests ADD COLUMN leave_type TEXT DEFAULT '普通の休み'")
+
+    # 有給付与履歴・付与予定
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS paid_leave_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            staff_id INTEGER NOT NULL,
+            planned_date TEXT DEFAULT '',
+            planned_days REAL DEFAULT 0,
+            grant_date TEXT DEFAULT '',
+            granted_days REAL DEFAULT 0,
+            notes TEXT DEFAULT ''
+        )
+    """)
+
+    # 基本スケジュール（曜日単位のコピー元）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            weekday INTEGER NOT NULL,
+            staff_id INTEGER NOT NULL,
+            visit_time TEXT NOT NULL,
+            end_time TEXT DEFAULT '',
+            patient_name TEXT NOT NULL,
+            address TEXT DEFAULT '',
+            memo TEXT DEFAULT '',
+            client_id INTEGER,
+            service_type TEXT DEFAULT '看護',
+            is_day_off INTEGER DEFAULT 0
+        )
+    """)
+
     # -----------------------------------------------------
     # 訪問予定
     # -----------------------------------------------------
@@ -797,6 +831,9 @@ def admin_nav():
         <a href="/admin/visits">訪問予定</a>
         <a href="/admin/calendar">カレンダー</a>
         <a href="/admin/leave/history">休暇履歴</a>
+        <a href="/admin/leave/apply">管理者休暇申請</a>
+        <a href="/admin/paid-leave">有給管理</a>
+        <a href="/admin/schedule-base">基本スケジュール</a>
     </div>
     """
 
@@ -1476,6 +1513,12 @@ def leave_page(staff_id: int):
                 <label>終了日</label>
                 <input type="date" name="end_date" required>
 
+                <label>休暇の種類</label>
+                <select name="leave_type" required>
+                    <option value="普通の休み" selected>普通の休み（有給残日数に影響しない）</option>
+                    <option value="有給休暇">有給休暇（承認後に残日数から差し引く）</option>
+                </select>
+
                 <label>申請理由</label>
                 <select name="reason_choice" id="reason_choice" onchange="toggleOtherLeaveReason()" required>
                     <option value="私用のため" selected>私用のため</option>
@@ -1517,7 +1560,8 @@ def submit_leave(
     start_date: str = Form(...),
     end_date: str = Form(...),
     reason_choice: str = Form("私用のため"),
-    reason_other: str = Form("")
+    reason_other: str = Form(""),
+    leave_type: str = Form("普通の休み")
 ):
 
     # 日付の逆転・不正入力を防止
@@ -1533,6 +1577,8 @@ def submit_leave(
     if reason_choice not in allowed_reasons:
         reason_choice = "私用のため"
     reason = reason_other.strip() if reason_choice == "その他" else reason_choice
+    if leave_type not in {"普通の休み", "有給休暇"}:
+        leave_type = "普通の休み"
     if not reason:
         return HTMLResponse("<meta charset='utf-8'><h2>申請理由を入力してください。</h2><a href='/staff/" + str(staff_id) + "/leave'>戻る</a>", status_code=400)
 
@@ -1546,15 +1592,16 @@ def submit_leave(
 
     cur.execute("""
         INSERT INTO leave_requests
-        (staff_id, start_date, end_date, reason, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (staff_id, start_date, end_date, reason, status, created_at, leave_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         staff_id,
         start_date,
         end_date,
         reason,
         "申請中",
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        leave_type
     ))
 
     conn.commit()
@@ -1593,13 +1640,18 @@ def staff_requests(staff_id: int):
     conn.close()
 
     approved_days = 0
+    paid_days = 0
     pending_count = 0
     rows = ""
     for request in requests:
         status = request["status"] or "申請中"
         if status == "承認":
             try:
-                approved_days += (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+                days = (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+                if (request["leave_type"] or "普通の休み") == "有給休暇":
+                    paid_days += days
+                else:
+                    approved_days += days
             except (ValueError, TypeError):
                 pass
         elif status == "申請中":
@@ -1608,6 +1660,7 @@ def staff_requests(staff_id: int):
         <tr>
             <td>{html.escape(format_wareki(request["start_date"]))}</td>
             <td>{html.escape(format_wareki(request["end_date"]))}</td>
+            <td>{html.escape(request["leave_type"] or "普通の休み")}</td>
             <td>{html.escape(request["reason"] or "")}</td>
             <td><strong>{html.escape(status)}</strong></td>
             <td>{html.escape(request["reject_reason"] or "")}</td>
@@ -1615,7 +1668,7 @@ def staff_requests(staff_id: int):
         """
 
     if not rows:
-        rows = '<tr><td colspan="5">休暇申請の履歴はありません。</td></tr>'
+        rows = '<tr><td colspan="6">休暇申請の履歴はありません。</td></tr>'
 
     return HTMLResponse(f"""
     <!DOCTYPE html><html lang="ja"><head>
@@ -1627,13 +1680,14 @@ def staff_requests(staff_id: int):
       <div class="card">
         <h2>{html.escape(staff["name"])} さんの休暇履歴</h2>
         <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;">
-          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">承認済み取得日数</div><strong style="font-size:26px;color:#1677c8;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">普通の休み（承認済み）</div><strong style="font-size:26px;color:#64748b;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">有給取得日数（承認済み）</div><strong style="font-size:26px;color:#1677c8;">{paid_days}日</strong></div>
           <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請中</div><strong style="font-size:26px;color:#d97706;">{pending_count}件</strong></div>
           <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請履歴</div><strong style="font-size:26px;">{len(requests)}件</strong></div>
         </div>
         <p class="small">承認済み日数は開始日・終了日を含む暦日数で集計しています。申請中・却下は取得日数に含みません。</p>
         <h3>申請・取得履歴</h3>
-        <table><tr><th>開始日</th><th>終了日</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
+        <table><tr><th>開始日</th><th>終了日</th><th>休暇種類</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
       </div>
     </div></body></html>
     """)
@@ -1647,7 +1701,7 @@ def staff_requests(staff_id: int):
 def admin_leave_history(staff_id: int = 0):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, name FROM staff WHERE role != 'admin' OR role IS NULL ORDER BY name")
+    cur.execute("SELECT id, name FROM staff ORDER BY name")
     staff_list = cur.fetchall()
     cur.execute("""
         SELECT leave_requests.*, staff.name AS staff_name
@@ -1664,13 +1718,18 @@ def admin_leave_history(staff_id: int = 0):
         options += f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(st["name"])}</option>'
 
     approved_days = 0
+    paid_days = 0
     pending_count = 0
     rows = ""
     for request in requests:
         status = request["status"] or "申請中"
         if status == "承認":
             try:
-                approved_days += (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+                days = (date.fromisoformat(request["end_date"]) - date.fromisoformat(request["start_date"])).days + 1
+                if (request["leave_type"] or "普通の休み") == "有給休暇":
+                    paid_days += days
+                else:
+                    approved_days += days
             except (ValueError, TypeError):
                 pass
         elif status == "申請中":
@@ -1680,12 +1739,13 @@ def admin_leave_history(staff_id: int = 0):
           <td>{html.escape(request["staff_name"] or "退職・削除済みスタッフ")}</td>
           <td>{html.escape(format_wareki(request["start_date"]))}</td>
           <td>{html.escape(format_wareki(request["end_date"]))}</td>
+          <td>{html.escape(request["leave_type"] or "普通の休み")}</td>
           <td>{html.escape(request["reason"] or "")}</td>
           <td>{html.escape(status)}</td>
           <td>{html.escape(request["reject_reason"] or "")}</td>
         </tr>"""
     if not rows:
-        rows = '<tr><td colspan="6">該当する履歴はありません。</td></tr>'
+        rows = '<tr><td colspan="7">該当する履歴はありません。</td></tr>'
 
     return HTMLResponse(f"""
     <!DOCTYPE html><html lang="ja"><head>
@@ -1701,12 +1761,13 @@ def admin_leave_history(staff_id: int = 0):
           <button type="submit">表示</button>
         </form>
         <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0;">
-          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">承認済み取得日数（表示対象）</div><strong style="font-size:26px;color:#1677c8;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">普通の休み（承認済み）</div><strong style="font-size:26px;color:#64748b;">{approved_days}日</strong></div>
+          <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">有給取得日数（承認済み）</div><strong style="font-size:26px;color:#1677c8;">{paid_days}日</strong></div>
           <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請中</div><strong style="font-size:26px;color:#d97706;">{pending_count}件</strong></div>
           <div class="info-box" style="flex:1;min-width:140px;margin:0;"><div class="small">申請履歴</div><strong style="font-size:26px;">{len(requests)}件</strong></div>
         </div>
         <p class="small">承認済み日数は開始日・終了日を含む暦日数で集計しています。全スタッフを選ぶと会社全体の合計です。</p>
-        <table><tr><th>スタッフ</th><th>開始日</th><th>終了日</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
+        <table><tr><th>スタッフ</th><th>開始日</th><th>終了日</th><th>休暇種類</th><th>理由</th><th>状態</th><th>却下理由</th></tr>{rows}</table>
       </div>
     </div></body></html>
     """)
@@ -1751,6 +1812,8 @@ def admin_page():
 
             <td>{html.escape(request["end_date"])}</td>
 
+            <td>{html.escape(request["leave_type"] or "普通の休み")}</td>
+
             <td>{html.escape(request["reason"] or "")}</td>
 
             <td>{html.escape(request["status"])}</td>
@@ -1794,7 +1857,7 @@ def admin_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="8">
+            <td colspan="9">
                 申請はありません。
             </td>
         </tr>
@@ -1833,6 +1896,7 @@ def admin_page():
                     <th>スタッフ</th>
                     <th>開始日</th>
                     <th>終了日</th>
+                    <th>休暇種類</th>
                     <th>理由</th>
                     <th>状態</th>
                     <th>却下理由</th>
@@ -3574,6 +3638,486 @@ def delete_next_week():
     )
 
 
+
+# =========================================================
+# 管理者：休暇申請（管理者自身の申請）
+# =========================================================
+
+@app.get("/admin/leave/apply", response_class=HTMLResponse)
+def admin_leave_apply_page():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff WHERE role = 'admin' ORDER BY name")
+    admins = cur.fetchall()
+    conn.close()
+    options = "".join(
+        f'<option value="{st["id"]}">{html.escape(st["name"])}</option>'
+        for st in admins
+    )
+    if not options:
+        options = '<option value="">管理者アカウントがありません</option>'
+    return HTMLResponse(f"""<!doctype html><html lang="ja"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>管理者休暇申請</title>{CSS}</head><body>
+<header><h1>管理者休暇申請</h1></header><div class="container">{admin_nav()}
+<div class="card"><h2>管理者の休暇を申請</h2>
+<p class="small">申請する管理者アカウントを選択してください。有給休暇は承認後に残日数へ反映されます。</p>
+<form method="post" action="/admin/leave/apply">
+<label>申請する管理者</label><select name="staff_id" required>{options}</select>
+<label>休暇の種類</label><select name="leave_type"><option value="普通の休み">普通の休み</option><option value="有給休暇">有給休暇</option></select>
+<label>開始日</label><input type="date" name="start_date" required>
+<label>終了日</label><input type="date" name="end_date" required>
+<label>申請理由</label><select name="reason_choice"><option>私用のため</option><option>体調不良のため</option><option>通院のため</option><option>家庭の事情のため</option><option>その他</option></select>
+<label>その他の場合の理由</label><input type="text" name="reason_other" maxlength="200">
+<button type="submit">休暇を申請する</button></form></div></div></body></html>""")
+
+
+@app.post("/admin/leave/apply")
+def admin_leave_apply_submit(
+    staff_id: int = Form(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    leave_type: str = Form("普通の休み"),
+    reason_choice: str = Form("私用のため"),
+    reason_other: str = Form("")
+):
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        if end < start:
+            raise ValueError
+    except ValueError:
+        return HTMLResponse("<meta charset='utf-8'><h2>日付が正しくありません。</h2><a href='/admin/leave/apply'>戻る</a>", status_code=400)
+    if leave_type not in {"普通の休み", "有給休暇"}:
+        leave_type = "普通の休み"
+    allowed = {"私用のため", "体調不良のため", "通院のため", "家庭の事情のため", "その他"}
+    if reason_choice not in allowed:
+        reason_choice = "私用のため"
+    reason = reason_other.strip() if reason_choice == "その他" else reason_choice
+    if not reason:
+        return HTMLResponse("<meta charset='utf-8'><h2>理由を入力してください。</h2><a href='/admin/leave/apply'>戻る</a>", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM staff WHERE id = ? AND role = 'admin'", (staff_id,))
+    if cur.fetchone() is None:
+        conn.close()
+        return HTMLResponse("管理者アカウントを確認できません。", status_code=404)
+    cur.execute("""
+        INSERT INTO leave_requests
+        (staff_id, start_date, end_date, reason, status, created_at, leave_type)
+        VALUES (?, ?, ?, ?, '申請中', ?, ?)
+    """, (staff_id, start_date, end_date, reason,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), leave_type))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin", status_code=303)
+
+
+# =========================================================
+# 管理者：有給付与・残日数管理
+# =========================================================
+
+@app.get("/admin/paid-leave", response_class=HTMLResponse)
+def admin_paid_leave(staff_id: int = 0):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    staff_list = cur.fetchall()
+    cur.execute("""
+        SELECT paid_leave_grants.*, staff.name AS staff_name
+        FROM paid_leave_grants
+        LEFT JOIN staff ON staff.id = paid_leave_grants.staff_id
+        WHERE (? = 0 OR paid_leave_grants.staff_id = ?)
+        ORDER BY COALESCE(NULLIF(paid_leave_grants.grant_date, ''),
+                          paid_leave_grants.planned_date) DESC, paid_leave_grants.id DESC
+    """, (staff_id, staff_id))
+    grants = cur.fetchall()
+    cur.execute("""
+        SELECT staff_id, SUM(granted_days) AS total
+        FROM paid_leave_grants
+        WHERE grant_date != '' AND grant_date <= date('now','localtime')
+        GROUP BY staff_id
+    """)
+    granted_map = {r["staff_id"]: float(r["total"] or 0) for r in cur.fetchall()}
+    cur.execute("""
+        SELECT staff_id, start_date, end_date
+        FROM leave_requests
+        WHERE status = '承認' AND leave_type = '有給休暇'
+    """)
+    used_map = {}
+    for r in cur.fetchall():
+        try:
+            n = (date.fromisoformat(r["end_date"]) - date.fromisoformat(r["start_date"])).days + 1
+            used_map[r["staff_id"]] = used_map.get(r["staff_id"], 0) + n
+        except (ValueError, TypeError):
+            pass
+    conn.close()
+
+    selected_name = "全スタッフ"
+    for st in staff_list:
+        if st["id"] == staff_id:
+            selected_name = st["name"]
+    options = '<option value="0">全スタッフ</option>' + "".join(
+        f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(st["name"])}</option>'
+        for st in staff_list
+    )
+    summary_rows = ""
+    target_staff = [st for st in staff_list if staff_id == 0 or st["id"] == staff_id]
+    for st in target_staff:
+        granted = granted_map.get(st["id"], 0)
+        used = used_map.get(st["id"], 0)
+        remaining = granted - used
+        summary_rows += f'<tr><td>{html.escape(st["name"])}</td><td>{granted:g}日</td><td>{used:g}日</td><td><strong>{remaining:g}日</strong></td></tr>'
+    if not summary_rows:
+        summary_rows = '<tr><td colspan="4">スタッフが登録されていません。</td></tr>'
+
+    grant_rows = ""
+    for g in grants:
+        grant_rows += f"""<tr><td>{html.escape(g["staff_name"] or "削除済み")}</td>
+<td>{html.escape(format_wareki(g["planned_date"])) or "—"}</td><td>{float(g["planned_days"] or 0):g}日</td>
+<td>{html.escape(format_wareki(g["grant_date"])) or "未付与"}</td><td>{float(g["granted_days"] or 0):g}日</td>
+<td>{html.escape(g["notes"] or "")}</td><td><form method="post" action="/admin/paid-leave/{g['id']}/delete" onsubmit="return confirm('この付与記録を削除しますか？')"><button class="danger">削除</button></form></td></tr>"""
+    if not grant_rows:
+        grant_rows = '<tr><td colspan="7">付与記録はありません。</td></tr>'
+
+    return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>有給管理</title>{CSS}</head><body>
+<header><h1>有給休暇管理</h1></header><div class="container">{admin_nav()}
+<div class="card"><h2>スタッフ別の有給残日数</h2>
+<form method="get" class="filter-row"><div><label>スタッフ</label><select name="staff_id">{options}</select></div><button>表示</button></form>
+<table><tr><th>スタッフ</th><th>付与済み日数</th><th>承認済み取得日数</th><th>残日数</th></tr>{summary_rows}</table>
+<p class="small">残日数＝実際に付与した日数の合計－承認済みの有給休暇日数。申請中・却下・普通の休みは差し引きません。</p></div>
+<div class="card"><h2>有給の付与予定・付与実績を登録</h2>
+<form method="post" action="/admin/paid-leave/add">
+<label>スタッフ</label><select name="staff_id" required>{"".join(f'<option value="{st["id"]}">{html.escape(st["name"])}</option>' for st in staff_list)}</select>
+<label>付与予定日</label><input type="date" name="planned_date">
+<label>付与予定日数</label><input type="number" name="planned_days" min="0" step="0.5" value="0">
+<label>実際の付与日（付与済みの場合）</label><input type="date" name="grant_date">
+<label>実際の付与日数</label><input type="number" name="granted_days" min="0" step="0.5" value="0">
+<label>メモ</label><input type="text" name="notes" maxlength="200">
+<button type="submit">付与情報を登録</button></form></div>
+<div class="card"><h2>{html.escape(selected_name)} の付与履歴</h2>
+<table><tr><th>スタッフ</th><th>付与予定日</th><th>予定日数</th><th>実際の付与日</th><th>付与日数</th><th>メモ</th><th>操作</th></tr>{grant_rows}</table>
+</div></div></body></html>""")
+
+
+@app.post("/admin/paid-leave/add")
+def admin_paid_leave_add(
+    staff_id: int = Form(...),
+    planned_date: str = Form(""),
+    planned_days: float = Form(0),
+    grant_date: str = Form(""),
+    granted_days: float = Form(0),
+    notes: str = Form("")
+):
+    for value in (planned_date, grant_date):
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                return HTMLResponse("日付が正しくありません。<a href='/admin/paid-leave'>戻る</a>", status_code=400)
+    if planned_days < 0 or granted_days < 0:
+        return HTMLResponse("日数は0以上で入力してください。", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM staff WHERE id = ?", (staff_id,))
+    if cur.fetchone() is None:
+        conn.close()
+        return HTMLResponse("スタッフが見つかりません。", status_code=404)
+    cur.execute("""
+        INSERT INTO paid_leave_grants
+        (staff_id, planned_date, planned_days, grant_date, granted_days, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (staff_id, planned_date, planned_days, grant_date, granted_days, notes.strip()))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/admin/paid-leave?staff_id={staff_id}", status_code=303)
+
+
+@app.post("/admin/paid-leave/{grant_id}/delete")
+def admin_paid_leave_delete(grant_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM paid_leave_grants WHERE id = ?", (grant_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/paid-leave", status_code=303)
+
+
+# =========================================================
+# 管理者：基本スケジュール（毎週のひな形）
+# =========================================================
+
+@app.get("/admin/schedule-base", response_class=HTMLResponse)
+def admin_schedule_base():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    staff_list = cur.fetchall()
+    cur.execute("SELECT id, name FROM clients ORDER BY name")
+    clients = cur.fetchall()
+    cur.execute("""
+        SELECT schedule_templates.*, staff.name AS staff_name,
+               COALESCE(clients.name, schedule_templates.patient_name) AS client_name
+        FROM schedule_templates
+        LEFT JOIN staff ON staff.id = schedule_templates.staff_id
+        LEFT JOIN clients ON clients.id = schedule_templates.client_id
+        ORDER BY weekday, visit_time, staff_name
+    """)
+    templates = cur.fetchall()
+    conn.close()
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    grouped = {i: [] for i in range(7)}
+    for t in templates:
+        grouped[t["weekday"]].append(t)
+    day_sections = ""
+    for wd, label in enumerate(weekdays):
+        rows = ""
+        for t in grouped[wd]:
+            rows += f"""<tr><td>{html.escape(t["visit_time"])}</td><td>{html.escape(t["staff_name"] or "削除済み")}</td>
+<td>{html.escape(t["client_name"] or "")}</td><td>{html.escape(t["service_type"] or "看護")}</td>
+<td><form method="post" action="/admin/schedule-base/{t['id']}/delete" onsubmit="return confirm('この基本予定を削除しますか？')"><button class="danger">削除</button></form></td></tr>"""
+        if not rows:
+            rows = '<tr><td colspan="5">登録なし</td></tr>'
+        day_sections += f'<h3>{label}曜日</h3><table><tr><th>時間</th><th>担当</th><th>利用者</th><th>区分</th><th>操作</th></tr>{rows}</table>'
+    staff_options = "".join(f'<option value="{s["id"]}">{html.escape(s["name"])}</option>' for s in staff_list)
+    client_options = '<option value="">利用者を選択（任意）</option>' + "".join(f'<option value="{c["id"]}">{html.escape(c["name"])}</option>' for c in clients)
+    return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>基本スケジュール</title>{CSS}</head><body>
+<header><h1>基本スケジュール</h1></header><div class="container">{admin_nav()}
+<div class="card"><h2>毎週のコピー元になる予定</h2>
+<p>ここに登録した曜日ごとの予定を、指定した週にコピーできます。基本スケジュール自体はコピー後も変更されません。</p>
+<form method="post" action="/admin/schedule-base/add">
+<label>曜日</label><select name="weekday">{"".join(f'<option value="{i}">{d}曜日</option>' for i,d in enumerate(weekdays))}</select>
+<label>担当スタッフ</label><select name="staff_id" required>{staff_options}</select>
+<label>利用者</label><select name="client_id">{client_options}</select>
+<label>利用者名（利用者一覧にない場合）</label><input name="patient_name" maxlength="100">
+<label>開始時刻</label><input type="time" name="visit_time" required>
+<label>終了時刻</label><input type="time" name="end_time">
+<label>業務区分</label><select name="service_type"><option>看護</option><option>リハビリ</option></select>
+<label>住所</label><input name="address">
+<label>メモ</label><input name="memo">
+<button type="submit">基本予定を追加</button></form></div>
+<div class="card"><h2>基本スケジュールを指定週へコピー</h2>
+<form method="post" action="/admin/schedule-base/copy" onsubmit="return confirm('基本スケジュールを指定した週へコピーします。既存予定は削除しません。続けますか？')">
+<label>コピー先の週の月曜日</label><input type="date" name="target_monday" required>
+<button class="success" type="submit">この週にコピー</button></form>
+<p class="small">同じ担当・日付・開始時刻・利用者の予定は重複登録せず、時間が重なる予定もスキップします。</p></div>
+<div class="card"><h2>基本スケジュール一覧</h2>{day_sections}</div>
+<div class="card"><h2>実際の週予定から基本スケジュールを作成</h2>
+<form method="post" action="/admin/schedule-base/save-week" onsubmit="return confirm('選択した週の予定で、現在の基本スケジュールをすべて置き換えます。よろしいですか？')">
+<label>元にする週の月曜日</label><input type="date" name="source_monday" required>
+<button type="submit" class="gray">この週を基本スケジュールとして保存</button></form></div>
+</div></body></html>""")
+
+
+@app.post("/admin/schedule-base/add")
+def admin_schedule_base_add(
+    weekday: int = Form(...),
+    staff_id: int = Form(...),
+    visit_time: str = Form(...),
+    end_time: str = Form(""),
+    client_id: str = Form(""),
+    patient_name: str = Form(""),
+    service_type: str = Form("看護"),
+    address: str = Form(""),
+    memo: str = Form("")
+):
+    if weekday not in range(7):
+        return HTMLResponse("曜日が正しくありません。", status_code=400)
+    try:
+        start = datetime.strptime(visit_time, "%H:%M")
+        if end_time:
+            end = datetime.strptime(end_time, "%H:%M")
+            if end <= start:
+                raise ValueError
+    except ValueError:
+        return HTMLResponse("時刻が正しくありません。", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM staff WHERE id = ?", (staff_id,))
+    if not cur.fetchone():
+        conn.close()
+        return HTMLResponse("スタッフが見つかりません。", status_code=404)
+    cid = int(client_id) if client_id.strip().isdigit() else None
+    if cid:
+        cur.execute("SELECT name, address FROM clients WHERE id = ?", (cid,))
+        c = cur.fetchone()
+        if not c:
+            conn.close()
+            return HTMLResponse("利用者が見つかりません。", status_code=404)
+        patient_name = c["name"]
+        if not address:
+            address = c["address"] or ""
+    if not patient_name.strip():
+        conn.close()
+        return HTMLResponse("利用者名を入力するか、利用者を選択してください。", status_code=400)
+    cur.execute("""
+        INSERT INTO schedule_templates
+        (weekday, staff_id, visit_time, end_time, patient_name, address, memo, client_id, service_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (weekday, staff_id, visit_time, end_time, patient_name.strip(), address.strip(),
+          memo.strip(), cid, service_type if service_type in {"看護", "リハビリ"} else "看護"))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/schedule-base", status_code=303)
+
+
+@app.post("/admin/schedule-base/{template_id}/delete")
+def admin_schedule_base_delete(template_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM schedule_templates WHERE id = ?", (template_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin/schedule-base", status_code=303)
+
+
+@app.post("/admin/schedule-base/copy")
+def admin_schedule_base_copy(target_monday: str = Form(...)):
+    try:
+        monday = date.fromisoformat(target_monday)
+        if monday.weekday() != 0:
+            return HTMLResponse("コピー先は月曜日を指定してください。<a href='/admin/schedule-base'>戻る</a>", status_code=400)
+    except ValueError:
+        return HTMLResponse("日付が正しくありません。", status_code=400)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM schedule_templates ORDER BY weekday, visit_time, id")
+    templates = cur.fetchall()
+    copied = skipped = 0
+    try:
+        for t in templates:
+            target_date = monday + timedelta(days=int(t["weekday"]))
+            if t["client_id"] is not None:
+                cur.execute("""SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id=? LIMIT 1""",
+                            (t["staff_id"], target_date.isoformat(), t["visit_time"], t["client_id"]))
+            else:
+                cur.execute("""SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id IS NULL AND patient_name=? LIMIT 1""",
+                            (t["staff_id"], target_date.isoformat(), t["visit_time"], t["patient_name"]))
+            if cur.fetchone():
+                skipped += 1
+                continue
+            conflict = visit_conflict(conn, t["staff_id"], target_date.isoformat(), t["visit_time"], t["end_time"] or "")
+            if conflict:
+                skipped += 1
+                continue
+            cur.execute("""
+                INSERT INTO visits
+                (staff_id, visit_date, visit_time, end_time, patient_name, address, memo, client_id, service_type, is_day_off)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (t["staff_id"], target_date.isoformat(), t["visit_time"], t["end_time"] or "",
+                  t["patient_name"], t["address"] or "", t["memo"] or "", t["client_id"],
+                  t["service_type"] or "看護", t["is_day_off"] or 0))
+            copied += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return RedirectResponse(f"/admin/calendar/week?start_date={monday.isoformat()}&copied={copied}&skipped={skipped}", status_code=303)
+
+
+@app.post("/admin/schedule-base/save-week")
+def admin_schedule_base_save_week(source_monday: str = Form(...)):
+    try:
+        monday = date.fromisoformat(source_monday)
+        if monday.weekday() != 0:
+            return HTMLResponse("元にする週は月曜日を指定してください。", status_code=400)
+    except ValueError:
+        return HTMLResponse("日付が正しくありません。", status_code=400)
+    sunday = monday + timedelta(days=6)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM visits WHERE visit_date >= ? AND visit_date <= ? ORDER BY visit_date, visit_time",
+                (monday.isoformat(), sunday.isoformat()))
+    source = cur.fetchall()
+    try:
+        cur.execute("DELETE FROM schedule_templates")
+        for v in source:
+            weekday = date.fromisoformat(v["visit_date"]).weekday()
+            cur.execute("""
+                INSERT INTO schedule_templates
+                (weekday, staff_id, visit_time, end_time, patient_name, address, memo, client_id, service_type, is_day_off)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (weekday, v["staff_id"], v["visit_time"], v["end_time"] or "",
+                  v["patient_name"], v["address"] or "", v["memo"] or "", v["client_id"],
+                  v["service_type"] or "看護", v["is_day_off"] or 0))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return RedirectResponse("/admin/schedule-base", status_code=303)
+
+
+# =========================================================
+# 管理者：週単位カレンダー・印刷
+# =========================================================
+
+@app.get("/admin/calendar/week", response_class=HTMLResponse)
+def admin_calendar_week(start_date: str = "", staff_id: int = 0,
+                        service_type: str = "all", copied: int = None, skipped: int = 0):
+    try:
+        start = date.fromisoformat(start_date) if start_date else date.today() - timedelta(days=date.today().weekday())
+        start = start - timedelta(days=start.weekday())
+    except ValueError:
+        start = date.today() - timedelta(days=date.today().weekday())
+    end = start + timedelta(days=6)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    staff_list = cur.fetchall()
+    cur.execute("""
+        SELECT visits.*, staff.name AS staff_name,
+               COALESCE(clients.name, visits.patient_name) AS client_name
+        FROM visits JOIN staff ON staff.id = visits.staff_id
+        LEFT JOIN clients ON clients.id = visits.client_id
+        WHERE visits.visit_date >= ? AND visits.visit_date <= ?
+          AND (? = 0 OR visits.staff_id = ?)
+          AND (? = 'all' OR COALESCE(visits.service_type, '看護') = ?)
+        ORDER BY visits.visit_date, visits.visit_time
+    """, (start.isoformat(), end.isoformat(), staff_id, staff_id, service_type, service_type))
+    visits = cur.fetchall()
+    conn.close()
+    by_day = {start + timedelta(days=i): [] for i in range(7)}
+    for v in visits:
+        try:
+            by_day[date.fromisoformat(v["visit_date"])].append(v)
+        except (ValueError, KeyError):
+            pass
+    weekday_names = ["月", "火", "水", "木", "金", "土", "日"]
+    day_html = ""
+    for i in range(7):
+        d = start + timedelta(days=i)
+        entries = ""
+        for v in by_day[d]:
+            is_off = bool(v["is_day_off"])
+            entries += f"""<tr><td>{html.escape(v["visit_time"])}{("〜" + html.escape(v["end_time"])) if v["end_time"] else ""}</td>
+<td>{html.escape(v["staff_name"])}</td><td>{html.escape(v["client_name"] or "")} {"【休み】" if is_off else ""}</td>
+<td>{html.escape(v["service_type"] or "看護")}</td><td>{html.escape(v["address"] or "")}</td><td>{html.escape(v["memo"] or "")}</td></tr>"""
+        if not entries:
+            entries = '<tr><td colspan="6">予定なし</td></tr>'
+        day_html += f'<h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><table class="week-table"><tr><th>時間</th><th>担当</th><th>利用者</th><th>区分</th><th>住所</th><th>メモ</th></tr>{entries}</table>'
+    options = '<option value="0">全スタッフ</option>' + "".join(
+        f'<option value="{s["id"]}" {"selected" if staff_id == s["id"] else ""}>{html.escape(s["name"])}</option>' for s in staff_list)
+    prev = start - timedelta(days=7)
+    nxt = start + timedelta(days=7)
+    msg = f'<div class="info-box">基本スケジュールのコピー：{copied}件追加、{skipped}件スキップ</div>' if copied is not None else ""
+    return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>週間訪問予定</title>{CSS}
+<style>.week-table{{margin-bottom:18px}}.week-table th,.week-table td{{padding:7px;font-size:12px}}@media print{{.week-table{{break-inside:avoid}}h3{{break-after:avoid}}}}</style>
+</head><body><header><h1>週間訪問予定</h1></header><div class="container">{admin_nav()}
+<div class="card no-print"><form method="get" class="filter-row"><div><label>週の基準日</label><input type="date" name="start_date" value="{start.isoformat()}"></div>
+<div><label>スタッフ</label><select name="staff_id">{options}</select></div>
+<div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type=="看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type=="リハビリ" else ""}>リハビリのみ</option></select></div><button>表示</button><button type="button" class="print-button" onclick="window.print()">1週間を印刷／PDF</button></form>
+<div class="calendar-nav"><a href="/admin/calendar/week?start_date={prev.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">← 前週</a><strong>{start.strftime("%Y/%m/%d")} 〜 {end.strftime("%Y/%m/%d")}</strong><a href="/admin/calendar/week?start_date={nxt.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">次週 →</a></div>
+{msg}<p><a href="/admin/calendar">月カレンダーへ戻る</a></p></div>
+<div class="card"><h2>{start.strftime("%Y年%m月%d日")}〜{end.strftime("%Y年%m月%d日")} の訪問予定</h2>{day_html}</div>
+</div></body></html>""")
+
+
+
 # =========================================================
 # 管理者カレンダー
 # =========================================================
@@ -3825,6 +4369,7 @@ def admin_calendar(
             {f'<div class="info-box">来週分を{deleted_next_week}件削除しました。</div>' if deleted_next_week is not None else ''}
 
             <a href="/admin/calendar/day?date={today.isoformat()}" class="add-link" style="margin-right:8px;">今日のスタッフ別時間割</a>
+            <a href="/admin/calendar/week?start_date={(today - timedelta(days=today.weekday())).isoformat()}" class="add-link" style="margin-right:8px;">週間予定・週印刷</a>
             <a
                 href="/admin/visits/add"
                 class="add-link"
