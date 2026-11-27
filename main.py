@@ -3849,16 +3849,20 @@ def admin_paid_leave_delete(grant_id: int):
 # =========================================================
 
 @app.get("/admin/schedule-base", response_class=HTMLResponse)
-def admin_schedule_base():
+def admin_schedule_base(copied: int = None, skipped: int = 0):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    cur.execute("""
+        SELECT id, name, furigana, staff_number FROM staff
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END, staff_number, name
+    """)
     staff_list = cur.fetchall()
-    cur.execute("SELECT id, name FROM clients ORDER BY name")
+    cur.execute("SELECT id, name, furigana, address FROM clients ORDER BY name")
     clients = cur.fetchall()
     cur.execute("""
-        SELECT schedule_templates.*, staff.name AS staff_name,
-               COALESCE(clients.name, schedule_templates.patient_name) AS client_name
+        SELECT schedule_templates.*, staff.name AS staff_name, staff.staff_number,
+               COALESCE(clients.name, schedule_templates.patient_name) AS client_name,
+               COALESCE(NULLIF(clients.address, ''), schedule_templates.address, '') AS client_address
         FROM schedule_templates
         LEFT JOIN staff ON staff.id = schedule_templates.staff_id
         LEFT JOIN clients ON clients.id = schedule_templates.client_id
@@ -3869,45 +3873,70 @@ def admin_schedule_base():
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     grouped = {i: [] for i in range(7)}
     for t in templates:
-        grouped[t["weekday"]].append(t)
+        grouped[int(t["weekday"])].append(t)
     day_sections = ""
     for wd, label in enumerate(weekdays):
         rows = ""
         for t in grouped[wd]:
-            rows += f"""<tr><td>{html.escape(t["visit_time"])}</td><td>{html.escape(t["staff_name"] or "削除済み")}</td>
-<td>{html.escape(t["client_name"] or "")}</td><td>{html.escape(t["service_type"] or "看護")}</td>
+            staff_label = ((str(t["staff_number"]) + "番　") if t["staff_number"] else "") + (t["staff_name"] or "削除済み")
+            rows += f"""<tr><td>{html.escape(t["visit_time"])}{("〜" + html.escape(t["end_time"])) if t["end_time"] else ""}</td><td>{html.escape(staff_label)}</td>
+<td>{html.escape(t["client_name"] or "")}</td><td>{html.escape(t["service_type"] or "看護")}</td><td>{html.escape(t["client_address"] or "")}</td>
 <td><form method="post" action="/admin/schedule-base/{t['id']}/delete" onsubmit="return confirm('この基本予定を削除しますか？')"><button class="danger">削除</button></form></td></tr>"""
         if not rows:
-            rows = '<tr><td colspan="5">登録なし</td></tr>'
-        day_sections += f'<h3>{label}曜日</h3><table><tr><th>時間</th><th>担当</th><th>利用者</th><th>区分</th><th>操作</th></tr>{rows}</table>'
-    staff_options = "".join(f'<option value="{s["id"]}">{html.escape(s["name"])}</option>' for s in staff_list)
-    client_options = '<option value="">利用者を選択（任意）</option>' + "".join(f'<option value="{c["id"]}">{html.escape(c["name"])}</option>' for c in clients)
-    return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>基本スケジュール</title>{CSS}</head><body>
+            rows = '<tr><td colspan="6">登録なし</td></tr>'
+        day_sections += f'<h3>{label}曜日</h3><div class="table-wrap"><table><tr><th>時間</th><th>担当</th><th>利用者</th><th>区分</th><th>住所</th><th>操作</th></tr>{rows}</table></div>'
+    staff_options = "".join(
+        f'<option value="{st["id"]}" data-search="{html.escape((st["name"] or "") + " " + (st["furigana"] or "") + " " + str(st["staff_number"] or ""), quote=True)}">{html.escape(((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"])}</option>'
+        for st in staff_list)
+    client_options = '<option value="">利用者を選択（任意）</option>' + "".join(
+        f'<option value="{cl["id"]}" data-search="{html.escape((cl["name"] or "") + " " + (cl["furigana"] or ""), quote=True)}" data-name="{html.escape(cl["name"] or "", quote=True)}" data-address="{html.escape(cl["address"] or "", quote=True)}">{html.escape(cl["name"])}{("（" + html.escape(cl["furigana"]) + "）") if cl["furigana"] else ""}</option>'
+        for cl in clients)
+    copied_msg = f'<div class="info-box">基本スケジュールをコピーしました：{copied}件追加、{skipped}件スキップ</div>' if copied is not None else ""
+    return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>基本スケジュール</title>{CSS}
+<style>
+.search-line{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.search-line>div{{min-width:0}}.hint{{font-size:12px;color:#64748b;margin:4px 0 8px}}.table-wrap{{overflow-x:auto}}.table-wrap table{{min-width:650px}}
+@media(max-width:600px){{.search-line{{grid-template-columns:1fr}}}}
+</style></head><body>
 <header><h1>基本スケジュール</h1></header><div class="container">{admin_nav()}
-<div class="card"><h2>毎週のコピー元になる予定</h2>
-<p>ここに登録した曜日ごとの予定を、指定した週にコピーできます。基本スケジュール自体はコピー後も変更されません。</p>
-<form method="post" action="/admin/schedule-base/add">
+{copied_msg}
+<div class="card"><h2>毎週のコピー元になる予定を登録</h2>
+<p>ここで登録した予定は、登録しただけでは実際の週間予定には入りません。下の「この週にコピー」を押すと、指定した週の訪問予定に反映されます。</p>
+<form method="post" action="/admin/schedule-base/add" id="baseScheduleForm">
 <label>曜日</label><select name="weekday">{"".join(f'<option value="{i}">{d}曜日</option>' for i,d in enumerate(weekdays))}</select>
-<label>担当スタッフ</label><select name="staff_id" required>{staff_options}</select>
-<label>利用者</label><select name="client_id">{client_options}</select>
-<label>利用者名（利用者一覧にない場合）</label><input name="patient_name" maxlength="100">
+<label>担当スタッフを検索（名前・ふりがな・スタッフ番号）</label><input type="search" id="staffSearch" placeholder="例：松永、マツナガ、35"><p class="hint">スタッフ番号だけを入力しても検索できます。</p>
+<label>担当スタッフ</label><select name="staff_id" id="baseStaffSelect" required>{staff_options}</select>
+<label>利用者を検索（名前・ふりがな）</label><input type="search" id="clientSearch" placeholder="例：山田、ヤマダ">
+<label>利用者</label><select name="client_id" id="baseClientSelect">{client_options}</select>
+<label>利用者名（利用者一覧にない場合）</label><input name="patient_name" id="basePatientName" maxlength="100" placeholder="利用者一覧から選ぶと自動入力されます">
 <label>開始時刻</label><input type="time" name="visit_time" required>
 <label>終了時刻</label><input type="time" name="end_time">
 <label>業務区分</label><select name="service_type"><option>看護</option><option>リハビリ</option></select>
-<label>住所</label><input name="address">
+<label>住所</label><input name="address" id="baseAddress" placeholder="利用者を選ぶと住所が自動入力されます">
 <label>メモ</label><input name="memo">
 <button type="submit">基本予定を追加</button></form></div>
-<div class="card"><h2>基本スケジュールを指定週へコピー</h2>
+<div class="card"><h2>基本スケジュールを指定週へ反映</h2>
+<p>登録した基本予定を、実際の訪問予定にコピーします。コピー後は週間予定画面で、その週だけの変更・調整ができます。</p>
 <form method="post" action="/admin/schedule-base/copy" onsubmit="return confirm('基本スケジュールを指定した週へコピーします。既存予定は削除しません。続けますか？')">
 <label>コピー先の週の月曜日</label><input type="date" name="target_monday" required>
-<button class="success" type="submit">この週にコピー</button></form>
-<p class="small">同じ担当・日付・開始時刻・利用者の予定は重複登録せず、時間が重なる予定もスキップします。</p></div>
+<button class="success" type="submit">この週のスケジュールに反映する</button></form>
+<p class="small">同じ担当・日付・開始時刻・利用者の予定は重複登録せず、時間が重なる予定もスキップします。反映結果は週間予定画面にも表示されます。</p>
+<p><a href="/admin/calendar/week">週間予定を確認する</a></p></div>
 <div class="card"><h2>基本スケジュール一覧</h2>{day_sections}</div>
 <div class="card"><h2>実際の週予定から基本スケジュールを作成</h2>
 <form method="post" action="/admin/schedule-base/save-week" onsubmit="return confirm('選択した週の予定で、現在の基本スケジュールをすべて置き換えます。よろしいですか？')">
 <label>元にする週の月曜日</label><input type="date" name="source_monday" required>
 <button type="submit" class="gray">この週を基本スケジュールとして保存</button></form></div>
-</div></body></html>""")
+</div>
+<script>
+(function(){{
+ const staffSearch=document.getElementById('staffSearch'), staffSelect=document.getElementById('baseStaffSelect');
+ const clientSearch=document.getElementById('clientSearch'), clientSelect=document.getElementById('baseClientSelect');
+ function filterOptions(input,select){{const q=(input.value||'').toLowerCase().replace(/[\\s　]/g,''); for(const opt of select.options){{if(!opt.value){{opt.hidden=false;continue;}} const hay=(opt.dataset.search||opt.textContent||'').toLowerCase().replace(/[\\s　]/g,''); opt.hidden=!!q&&!hay.includes(q);}} if(select.selectedOptions.length&&select.selectedOptions[0].hidden)select.value='';}}
+ staffSearch.addEventListener('input',()=>filterOptions(staffSearch,staffSelect));
+ clientSearch.addEventListener('input',()=>filterOptions(clientSearch,clientSelect));
+ clientSelect.addEventListener('change',()=>{{const opt=clientSelect.selectedOptions[0]; if(!opt||!opt.value)return; document.getElementById('basePatientName').value=opt.dataset.name||''; document.getElementById('baseAddress').value=opt.dataset.address||'';}});
+}})();
+</script></body></html>""")
 
 
 @app.post("/admin/schedule-base/add")
@@ -3946,8 +3975,8 @@ def admin_schedule_base_add(
             conn.close()
             return HTMLResponse("利用者が見つかりません。", status_code=404)
         patient_name = c["name"]
-        if not address:
-            address = c["address"] or ""
+        # 利用者に登録された住所を優先し、空欄の場合だけ手入力住所を使う
+        address = c["address"] or address
     if not patient_name.strip():
         conn.close()
         return HTMLResponse("利用者名を入力するか、利用者を選択してください。", status_code=400)
@@ -3982,17 +4011,23 @@ def admin_schedule_base_copy(target_monday: str = Form(...)):
         return HTMLResponse("日付が正しくありません。", status_code=400)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM schedule_templates ORDER BY weekday, visit_time, id")
+    cur.execute("""
+        SELECT schedule_templates.*,
+               COALESCE(clients.name, schedule_templates.patient_name) AS current_client_name,
+               COALESCE(NULLIF(clients.address, ''), schedule_templates.address, '') AS current_client_address
+        FROM schedule_templates LEFT JOIN clients ON clients.id = schedule_templates.client_id
+        ORDER BY schedule_templates.weekday, schedule_templates.visit_time, schedule_templates.id
+    """)
     templates = cur.fetchall()
     copied = skipped = 0
     try:
         for t in templates:
             target_date = monday + timedelta(days=int(t["weekday"]))
             if t["client_id"] is not None:
-                cur.execute("""SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id=? LIMIT 1""",
+                cur.execute("SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id=? LIMIT 1",
                             (t["staff_id"], target_date.isoformat(), t["visit_time"], t["client_id"]))
             else:
-                cur.execute("""SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id IS NULL AND patient_name=? LIMIT 1""",
+                cur.execute("SELECT 1 FROM visits WHERE staff_id=? AND visit_date=? AND visit_time=? AND client_id IS NULL AND patient_name=? LIMIT 1",
                             (t["staff_id"], target_date.isoformat(), t["visit_time"], t["patient_name"]))
             if cur.fetchone():
                 skipped += 1
@@ -4006,7 +4041,7 @@ def admin_schedule_base_copy(target_monday: str = Form(...)):
                 (staff_id, visit_date, visit_time, end_time, patient_name, address, memo, client_id, service_type, is_day_off)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (t["staff_id"], target_date.isoformat(), t["visit_time"], t["end_time"] or "",
-                  t["patient_name"], t["address"] or "", t["memo"] or "", t["client_id"],
+                  t["current_client_name"] or t["patient_name"], t["current_client_address"] or "", t["memo"] or "", t["client_id"],
                   t["service_type"] or "看護", t["is_day_off"] or 0))
             copied += 1
         conn.commit()
@@ -4067,17 +4102,20 @@ def admin_calendar_week(start_date: str = "", staff_id: int = 0,
     end = start + timedelta(days=6)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, name FROM staff ORDER BY name")
+    cur.execute("""
+        SELECT id, name, staff_number, calendar_color FROM staff
+        ORDER BY CASE WHEN staff_number IS NULL THEN 1 ELSE 0 END, staff_number, name
+    """)
     staff_list = cur.fetchall()
     cur.execute("""
-        SELECT visits.*, staff.name AS staff_name,
+        SELECT visits.*, staff.name AS staff_name, staff.staff_number, staff.calendar_color,
                COALESCE(clients.name, visits.patient_name) AS client_name
         FROM visits JOIN staff ON staff.id = visits.staff_id
         LEFT JOIN clients ON clients.id = visits.client_id
         WHERE visits.visit_date >= ? AND visits.visit_date <= ?
           AND (? = 0 OR visits.staff_id = ?)
           AND (? = 'all' OR COALESCE(visits.service_type, '看護') = ?)
-        ORDER BY visits.visit_date, visits.visit_time
+        ORDER BY visits.visit_date, visits.visit_time, staff.staff_number, staff.name
     """, (start.isoformat(), end.isoformat(), staff_id, staff_id, service_type, service_type))
     visits = cur.fetchall()
     conn.close()
@@ -4087,35 +4125,61 @@ def admin_calendar_week(start_date: str = "", staff_id: int = 0,
             by_day[date.fromisoformat(v["visit_date"])].append(v)
         except (ValueError, KeyError):
             pass
+    display_staff_list = [st for st in staff_list if staff_id == 0 or st["id"] == staff_id]
     weekday_names = ["月", "火", "水", "木", "金", "土", "日"]
     day_html = ""
     for i in range(7):
         d = start + timedelta(days=i)
-        entries = ""
-        for v in by_day[d]:
-            is_off = bool(v["is_day_off"])
-            entries += f"""<tr><td>{html.escape(v["visit_time"])}{("〜" + html.escape(v["end_time"])) if v["end_time"] else ""}</td>
-<td>{html.escape(v["staff_name"])}</td><td>{html.escape(v["client_name"] or "")} {"【休み】" if is_off else ""}</td>
-<td>{html.escape(v["service_type"] or "看護")}</td><td>{html.escape(v["address"] or "")}</td><td>{html.escape(v["memo"] or "")}</td></tr>"""
-        if not entries:
-            entries = '<tr><td colspan="6">予定なし</td></tr>'
-        day_html += f'<h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><table class="week-table"><tr><th>時間</th><th>担当</th><th>利用者</th><th>区分</th><th>住所</th><th>メモ</th></tr>{entries}</table>'
+        day_visits = by_day[d]
+        times = sorted({v["visit_time"] for v in day_visits})
+        if not times:
+            day_html += f'<section class="day-sheet"><h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><p class="empty-day">予定なし</p></section>'
+            continue
+        cells = {}
+        for v in day_visits:
+            cells.setdefault((v["visit_time"], v["staff_id"]), []).append(v)
+        def safe_staff_color(value):
+            value = value or "#2563eb"
+            return value if len(value) == 7 and value.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in value[1:]) else "#2563eb"
+        head = "".join(f'<th class="staff-head" style="--staff-color:{safe_staff_color(st["calendar_color"])}">{html.escape(((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"])}</th>' for st in display_staff_list)
+        body = ""
+        for tm in times:
+            row = f'<th class="time-head">{html.escape(tm)}</th>'
+            for st in display_staff_list:
+                matches = cells.get((tm, st["id"]), [])
+                content = ""
+                for v in matches:
+                    kind = v["service_type"] or "看護"
+                    off = bool(v["is_day_off"])
+                    title = ("【休み】" if off else "") + (v["client_name"] or "")
+                    content += f'<div class="visit-cell"><strong>{html.escape(title)}</strong><span class="kind">{html.escape(kind)}</span>'
+                    if v["end_time"]:
+                        content += f'<small>{html.escape(v["visit_time"])}〜{html.escape(v["end_time"])}</small>'
+                    if v["address"]:
+                        content += f'<small>{html.escape(v["address"])}</small>'
+                    if v["memo"]:
+                        content += f'<small>{html.escape(v["memo"])}</small>'
+                    content += '</div>'
+                row += f'<td>{content or "<span class=\'empty-cell\'>—</span>"}</td>'
+            body += f'<tr>{row}</tr>'
+        day_html += f'<section class="day-sheet"><h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><div class="week-grid-wrap"><table class="week-grid"><thead><tr><th class="time-head">時間</th>{head}</tr></thead><tbody>{body}</tbody></table></div></section>'
     options = '<option value="0">全スタッフ</option>' + "".join(
-        f'<option value="{s["id"]}" {"selected" if staff_id == s["id"] else ""}>{html.escape(s["name"])}</option>' for s in staff_list)
+        f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"])}</option>' for st in staff_list)
     prev = start - timedelta(days=7)
     nxt = start + timedelta(days=7)
     msg = f'<div class="info-box">基本スケジュールのコピー：{copied}件追加、{skipped}件スキップ</div>' if copied is not None else ""
     return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>週間訪問予定</title>{CSS}
-<style>.week-table{{margin-bottom:18px}}.week-table th,.week-table td{{padding:7px;font-size:12px}}@media print{{.week-table{{break-inside:avoid}}h3{{break-after:avoid}}}}</style>
-</head><body><header><h1>週間訪問予定</h1></header><div class="container">{admin_nav()}
+<style>
+.week-grid-wrap{{overflow-x:auto}}.week-grid{{border-collapse:collapse;table-layout:fixed;min-width:850px;width:100%;margin:0 0 16px}}.week-grid th,.week-grid td{{border:1px solid #cbd5e1;padding:7px;vertical-align:top;font-size:12px;min-width:115px}}.week-grid .time-head{{min-width:65px;width:72px;background:#eaf0f6;text-align:center;white-space:nowrap}}.week-grid .staff-head{{background:#eaf0f6;border-top:4px solid var(--staff-color);text-align:center}}.visit-cell{{border-left:3px solid #2563eb;background:#f1f6fc;border-radius:5px;padding:6px;margin:2px 0;display:flex;flex-direction:column;gap:3px;overflow-wrap:anywhere}}.visit-cell .kind{{font-size:10px;color:#1d4ed8;font-weight:bold}}.visit-cell small{{color:#475569;font-size:10px}}.empty-cell,.empty-day{{color:#94a3b8}}.day-sheet{{margin-bottom:22px;break-inside:avoid}}.day-sheet h3{{background:#eaf0f6;padding:8px 10px;border-left:4px solid #2563eb;margin-bottom:8px}}
+@media print{{@page{{size:A4 landscape;margin:8mm}}body{{background:white;font-size:10px}}header,.no-print,nav,.nav{{display:none!important}}.container{{max-width:none!important;margin:0!important;padding:0!important}}.card{{box-shadow:none!important;border:0!important;padding:0!important;margin:0!important}}.day-sheet{{break-inside:avoid;page-break-inside:avoid;margin-bottom:8mm}}.week-grid{{min-width:0!important;width:100%!important}}.week-grid th,.week-grid td{{font-size:8px;padding:4px;min-width:0}}.visit-cell{{padding:3px}}.visit-cell small{{font-size:7px}}.day-sheet h3{{font-size:12px;padding:5px}}}}
+</style></head><body><header><h1>週間訪問予定</h1></header><div class="container">{admin_nav()}
 <div class="card no-print"><form method="get" class="filter-row"><div><label>週の基準日</label><input type="date" name="start_date" value="{start.isoformat()}"></div>
 <div><label>スタッフ</label><select name="staff_id">{options}</select></div>
-<div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type=="看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type=="リハビリ" else ""}>リハビリのみ</option></select></div><button>表示</button><button type="button" class="print-button" onclick="window.print()">1週間を印刷／PDF</button></form>
+<div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type=="看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type=="リハビリ" else ""}>リハビリのみ</option></select></div><button>表示</button><button type="button" class="print-button" onclick="window.print()">週間を印刷／PDF</button></form>
 <div class="calendar-nav"><a href="/admin/calendar/week?start_date={prev.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">← 前週</a><strong>{start.strftime("%Y/%m/%d")} 〜 {end.strftime("%Y/%m/%d")}</strong><a href="/admin/calendar/week?start_date={nxt.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">次週 →</a></div>
-{msg}<p><a href="/admin/calendar">月カレンダーへ戻る</a></p></div>
-<div class="card"><h2>{start.strftime("%Y年%m月%d日")}〜{end.strftime("%Y年%m月%d日")} の訪問予定</h2>{day_html}</div>
+{msg}<p><a href="/admin/calendar">月カレンダーへ戻る</a> ／ <a href="/admin/schedule-base">基本スケジュールへ</a></p></div>
+<div class="card"><h2>{start.strftime("%Y年%m月%d日")}〜{end.strftime("%Y年%m月%d日")} の訪問予定</h2><p class="small">日付ごとに、縦が時間・横が担当スタッフです。</p>{day_html}</div>
 </div></body></html>""")
-
 
 
 # =========================================================
