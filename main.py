@@ -4127,42 +4127,75 @@ def admin_calendar_week(start_date: str = "", staff_id: int = 0,
             pass
     display_staff_list = [st for st in staff_list if staff_id == 0 or st["id"] == staff_id]
     weekday_names = ["月", "火", "水", "木", "金", "土", "日"]
-    day_html = ""
+    def safe_staff_color(value):
+        value = value or "#2563eb"
+        return value if len(value) == 7 and value.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in value[1:]) else "#2563eb"
+
+    # WiseMan風：左にスタッフ、上に日付、交差する欄に時間順の訪問予定を表示
+    staff_day = {(st["id"], start + timedelta(days=i)): []
+                 for st in display_staff_list for i in range(7)}
+    for v in visits:
+        try:
+            visit_day = date.fromisoformat(v["visit_date"])
+            staff_day.setdefault((v["staff_id"], visit_day), []).append(v)
+        except (ValueError, KeyError):
+            pass
+
+    day_headers = "".join(
+        f'<th class="date-head">{(start + timedelta(days=i)).month}/{(start + timedelta(days=i)).day}<br>({weekday_names[i]})</th>'
+        for i in range(7)
+    )
+    daily_counts = []
     for i in range(7):
         d = start + timedelta(days=i)
-        day_visits = by_day[d]
-        times = sorted({v["visit_time"] for v in day_visits})
-        if not times:
-            day_html += f'<section class="day-sheet"><h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><p class="empty-day">予定なし</p></section>'
-            continue
-        cells = {}
-        for v in day_visits:
-            cells.setdefault((v["visit_time"], v["staff_id"]), []).append(v)
-        def safe_staff_color(value):
-            value = value or "#2563eb"
-            return value if len(value) == 7 and value.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in value[1:]) else "#2563eb"
-        head = "".join(f'<th class="staff-head" style="--staff-color:{safe_staff_color(st["calendar_color"])}">{html.escape(((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"])}</th>' for st in display_staff_list)
-        body = ""
-        for tm in times:
-            row = f'<th class="time-head">{html.escape(tm)}</th>'
-            for st in display_staff_list:
-                matches = cells.get((tm, st["id"]), [])
-                content = ""
-                for v in matches:
-                    kind = v["service_type"] or "看護"
-                    off = bool(v["is_day_off"])
-                    title = ("【休み】" if off else "") + (v["client_name"] or "")
-                    content += f'<div class="visit-cell"><strong>{html.escape(title)}</strong><span class="kind">{html.escape(kind)}</span>'
-                    if v["end_time"]:
-                        content += f'<small>{html.escape(v["visit_time"])}〜{html.escape(v["end_time"])}</small>'
-                    if v["address"]:
-                        content += f'<small>{html.escape(v["address"])}</small>'
-                    if v["memo"]:
-                        content += f'<small>{html.escape(v["memo"])}</small>'
-                    content += '</div>'
-                row += f'<td>{content or "<span class=\'empty-cell\'>—</span>"}</td>'
-            body += f'<tr>{row}</tr>'
-        day_html += f'<section class="day-sheet"><h3>{d.month}/{d.day}（{weekday_names[i]}）</h3><div class="week-grid-wrap"><table class="week-grid"><thead><tr><th class="time-head">時間</th>{head}</tr></thead><tbody>{body}</tbody></table></div></section>'
+        daily_counts.append(sum(len(staff_day.get((st["id"], d), [])) for st in display_staff_list))
+    total_row = '<tr class="total-row"><th colspan="2">合計（件）</th>' + ''.join(
+        f'<td>訪問 {count}</td>' for count in daily_counts
+    ) + '</tr>'
+
+    staff_rows = ""
+    for st in display_staff_list:
+        cells = ""
+        for i in range(7):
+            d = start + timedelta(days=i)
+            entries = sorted(staff_day.get((st["id"], d), []), key=lambda v: (v["visit_time"] or "", v["id"]))
+            content = ""
+            for v in entries:
+                kind = (v["service_type"] or "看護").strip()
+                off = bool(v["is_day_off"])
+                if off:
+                    color_class = "kind-off"
+                elif "予防" in kind:
+                    color_class = "kind-prevent"
+                elif "医療" in kind:
+                    color_class = "kind-medical"
+                elif "リハ" in kind:
+                    color_class = "kind-rehab"
+                else:
+                    color_class = "kind-nursing"
+                client = "休み" if off else (v["client_name"] or v["patient_name"] or "利用者未設定")
+                time_text = (v["visit_time"] or "時間未設定")
+                if v["end_time"]:
+                    time_text += "〜" + v["end_time"]
+                content += f'<div class="shift-item {color_class}"><strong>{html.escape(time_text)}</strong><span>{html.escape(client)}</span>'
+                if v["memo"]:
+                    content += f'<small>{html.escape(v["memo"])}</small>'
+                content += '</div>'
+            cells += f'<td class="schedule-cell">{content or "<span class=\"empty-cell\">　</span>"}</td>'
+        staff_label = ((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"]
+        staff_week_visits = [v for i in range(7) for v in staff_day.get((st["id"], start + timedelta(days=i)), []) if not bool(v["is_day_off"]) and v["visit_time"]]
+        if staff_week_visits:
+            first_time = min(v["visit_time"] for v in staff_week_visits)
+            last_time = max((v["end_time"] or v["visit_time"]) for v in staff_week_visits)
+            time_band = f"{first_time}〜{last_time}"
+        else:
+            time_band = "—"
+        staff_rows += f'<tr><th class="staff-name" style="--staff-color:{safe_staff_color(st["calendar_color"])}">{html.escape(staff_label)}</th><td class="staff-band">{html.escape(time_band)}</td>{cells}</tr>' 
+
+    if not display_staff_list:
+        staff_rows = '<tr><td colspan="9" class="empty-cell">該当するスタッフがいません。</td></tr>'
+    legend = """<div class="legend"><span><i class="kind-nursing"></i>訪問看護</span><span><i class="kind-prevent"></i>予防訪問看護</span><span><i class="kind-medical"></i>医療保険</span><span><i class="kind-rehab"></i>リハビリ</span><span><i class="kind-off"></i>休み</span></div>"""
+    day_html = f'<div class="wise-week-wrap"><table class="wise-week"><thead><tr><th class="staff-title">訪問職員名</th><th class="band-title">訪問時間帯</th>{day_headers}</tr></thead><tbody>{total_row}{staff_rows}</tbody></table></div>{legend}'
     options = '<option value="0">全スタッフ</option>' + "".join(
         f'<option value="{st["id"]}" {"selected" if staff_id == st["id"] else ""}>{html.escape(((str(st["staff_number"]) + "番　") if st["staff_number"] else "") + st["name"])}</option>' for st in staff_list)
     prev = start - timedelta(days=7)
@@ -4170,15 +4203,15 @@ def admin_calendar_week(start_date: str = "", staff_id: int = 0,
     msg = f'<div class="info-box">基本スケジュールのコピー：{copied}件追加、{skipped}件スキップ</div>' if copied is not None else ""
     return HTMLResponse(f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>週間訪問予定</title>{CSS}
 <style>
-.week-grid-wrap{{overflow-x:auto}}.week-grid{{border-collapse:collapse;table-layout:fixed;min-width:850px;width:100%;margin:0 0 16px}}.week-grid th,.week-grid td{{border:1px solid #cbd5e1;padding:7px;vertical-align:top;font-size:12px;min-width:115px}}.week-grid .time-head{{min-width:65px;width:72px;background:#eaf0f6;text-align:center;white-space:nowrap}}.week-grid .staff-head{{background:#eaf0f6;border-top:4px solid var(--staff-color);text-align:center}}.visit-cell{{border-left:3px solid #2563eb;background:#f1f6fc;border-radius:5px;padding:6px;margin:2px 0;display:flex;flex-direction:column;gap:3px;overflow-wrap:anywhere}}.visit-cell .kind{{font-size:10px;color:#1d4ed8;font-weight:bold}}.visit-cell small{{color:#475569;font-size:10px}}.empty-cell,.empty-day{{color:#94a3b8}}.day-sheet{{margin-bottom:22px;break-inside:avoid}}.day-sheet h3{{background:#eaf0f6;padding:8px 10px;border-left:4px solid #2563eb;margin-bottom:8px}}
-@media print{{@page{{size:A4 landscape;margin:8mm}}body{{background:white;font-size:10px}}header,.no-print,nav,.nav{{display:none!important}}.container{{max-width:none!important;margin:0!important;padding:0!important}}.card{{box-shadow:none!important;border:0!important;padding:0!important;margin:0!important}}.day-sheet{{break-inside:avoid;page-break-inside:avoid;margin-bottom:8mm}}.week-grid{{min-width:0!important;width:100%!important}}.week-grid th,.week-grid td{{font-size:8px;padding:4px;min-width:0}}.visit-cell{{padding:3px}}.visit-cell small{{font-size:7px}}.day-sheet h3{{font-size:12px;padding:5px}}}}
+.wise-week-wrap{{overflow-x:auto}}.wise-week{{border-collapse:collapse;table-layout:fixed;width:100%;min-width:1100px;background:#fff}}.wise-week th,.wise-week td{{border:1px solid #9ca3af;padding:4px;vertical-align:top;font-size:11px}}.wise-week .staff-title{{width:125px;background:#dbeafe}}.wise-week .band-title{{width:82px;background:#dbeafe}}.wise-week .date-head{{background:#bfdbfe;text-align:center;min-width:125px;height:38px}}.wise-week .staff-name{{background:#f8fafc;text-align:left;vertical-align:middle;border-left:5px solid var(--staff-color);font-weight:bold}}.wise-week .staff-band{{background:#f8fafc;text-align:center;vertical-align:middle;color:#475569;font-size:10px}}.wise-week .total-row th,.wise-week .total-row td{{background:#fef3c7;font-weight:bold;text-align:center}}.schedule-cell{{height:90px}}.shift-item{{padding:4px 5px;margin:2px 0;border:1px solid #cbd5e1;display:flex;flex-direction:column;gap:2px;overflow-wrap:anywhere;break-inside:avoid}}.shift-item strong{{font-size:10px;white-space:nowrap}}.shift-item span{{font-weight:600}}.shift-item small{{font-size:9px;color:#475569}}.kind-nursing{{background:#facc15}}.kind-prevent{{background:#bae6fd}}.kind-medical{{background:#fbcfe8}}.kind-rehab{{background:#bbf7d0}}.kind-off{{background:#e5e7eb}}.legend{{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0;font-size:11px}}.legend span{{display:flex;align-items:center;gap:5px}}.legend i{{display:inline-block;width:20px;height:12px;border:1px solid #9ca3af}}.empty-cell{{color:#cbd5e1}}
+@media print{{@page{{size:A3 landscape;margin:8mm}}body{{background:white;font-size:9px}}header,.no-print,nav,.nav{{display:none!important}}.container{{max-width:none!important;margin:0!important;padding:0!important}}.card{{box-shadow:none!important;border:0!important;padding:0!important;margin:0!important}}.wise-week-wrap{{overflow:visible}}.wise-week{{min-width:0!important;width:100%!important}}.wise-week th,.wise-week td{{font-size:8px;padding:3px}}.wise-week .staff-title{{width:100px}}.wise-week .band-title{{width:65px}}.wise-week .date-head{{min-width:0}}.schedule-cell{{height:auto;min-height:58px}}.shift-item{{padding:2px;margin:1px 0}}.shift-item strong,.shift-item span{{font-size:8px}}.shift-item small{{font-size:7px}}.legend{{font-size:8px;margin-top:5px}}}}
 </style></head><body><header><h1>週間訪問予定</h1></header><div class="container">{admin_nav()}
 <div class="card no-print"><form method="get" class="filter-row"><div><label>週の基準日</label><input type="date" name="start_date" value="{start.isoformat()}"></div>
 <div><label>スタッフ</label><select name="staff_id">{options}</select></div>
 <div><label>業務区分</label><select name="service_type"><option value="all">すべて</option><option value="看護" {"selected" if service_type=="看護" else ""}>看護のみ</option><option value="リハビリ" {"selected" if service_type=="リハビリ" else ""}>リハビリのみ</option></select></div><button>表示</button><button type="button" class="print-button" onclick="window.print()">週間を印刷／PDF</button></form>
 <div class="calendar-nav"><a href="/admin/calendar/week?start_date={prev.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">← 前週</a><strong>{start.strftime("%Y/%m/%d")} 〜 {end.strftime("%Y/%m/%d")}</strong><a href="/admin/calendar/week?start_date={nxt.isoformat()}&staff_id={staff_id}&service_type={quote(service_type)}">次週 →</a></div>
 {msg}<p><a href="/admin/calendar">月カレンダーへ戻る</a> ／ <a href="/admin/schedule-base">基本スケジュールへ</a></p></div>
-<div class="card"><h2>{start.strftime("%Y年%m月%d日")}〜{end.strftime("%Y年%m月%d日")} の訪問予定</h2><p class="small">日付ごとに、縦が時間・横が担当スタッフです。</p>{day_html}</div>
+<div class="card"><h2>訪問職員予定（週別）</h2><p class="small">スタッフごとの行に、各日の訪問予定を時間順で表示しています。</p>{day_html}</div>
 </div></body></html>""")
 
 
